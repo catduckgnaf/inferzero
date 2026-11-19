@@ -130,6 +130,39 @@ on their sums there.
 
 On Windows the B60s report no peer access, so nothing changes there.
 
+### No peer access on Linux: the kernel's P2PDMA
+
+On Linux the xe driver gives peer access only when the kernel is built with `CONFIG_PCI_P2PDMA=y`. Not every kernel
+is: Unraid 7.4.0's `6.18.60-Unraid` has `# CONFIG_PCI_P2PDMA is not set`, and there two Arc Pro B50s report no peer
+access and every sum goes through host memory, though the board allows direct copies (catduckgnaf, issue #59). To
+check a kernel:
+
+```
+grep P2PDMA /boot/config-$(uname -r)              # or: zcat /proc/config.gz | grep P2PDMA
+grep -c ' pci_p2pdma_add_resource$' /proc/kallsyms  # 0: not built in
+```
+
+`bin/mgpu_probe` shows the result: `peer yes` and working "direct" rows when the kernel has it. The same two B50s on
+the same kernel version rebuilt with `CONFIG_PCI_P2PDMA=y` (both cards PCIe 3.0 x8, on root ports of one Xeon socket,
+IOMMU in passthrough), `mgpu_probe`:
+
+| Path | 20 KB copy | 40 MB copy |
+|---|---|---|
+| through host memory | 16.3-18.4 µs | 2.8-2.9 GB/s |
+| direct | 11.1-14.2 µs | 4.8 GB/s |
+
+The 35B-A3B (Ornith 1.5 Q4_K_M, release 2026.11.19.04, `--bench-pp 4096 --n 128 --gpus 2`):
+
+| Sums | 4K prompt (tok/s) | Generation (tok/s) |
+|---|---|---|
+| through host memory (stock kernel, `ARC_XSPLIT_TP=1`) | 1,460 | 66.8 |
+| direct (P2PDMA kernel) | 1,490-1,494 | 63.2-64.2 |
+
+On these PCIe 3.0 x8 links direct gains ~2 % on prompts and nothing on generation (the engine logs 4.8 GB/s direct
+against 5.6 through host memory). The 27B (Qwen3.8 27B Q4_K_M, `--bench-batch 4 --gpus 2`) went from 59.1 to 62.2 tok/s
+at B4. The logits stay the same (F30's `--dump-logits` md5 identical on both kernels). Faster links gain more (the B60s
+above).
+
 Measured on two Pro B60s on Linux (scenic6942, issue #17, both cards on PCIe 4.0 x8; the 27B GSQ-RCO IQ3_S,
 `--bench-pp 4096 --n 128`, three prompt runs each): the links measure 14.1 GB/s direct and 14.2 through host memory.
 
@@ -282,12 +315,16 @@ next chunk's attention work.
 
 ## Mixture of experts (Qwen3.6 35B-A3B, 2026-11-01)
 
-**A MoE model that fits on one card is faster unsplit when the cards have no peer access.** Two Arc Pro B50s whose
-driver gives no direct copies between them (the sums through host memory, ~22.5 µs a small copy) ran a 35B-A3B
-fine-tune at 40-46 tok/s on one card and 8.16 split over both (catduckgnaf, issue #59, release 2026.11.16.16): a
-token pays 80 sums, and the split turns off the step that runs a token's cached experts before its missed ones
-arrive (`ARC_XSPLIT`, see F30). One model per card is the fast setup there. With peer access and every expert
-resident, two B60s beat one (35B generation 70.1 -> 91.2 tok/s).
+**A MoE model that fits on one card: the split still wins generation without peer access, once timed after a
+warm-up.** Two Arc Pro B50s whose driver gave no direct copies between them (the sums through host memory, ~22.5 µs a
+small copy) first measured a 35B-A3B fine-tune at 40-46 tok/s on one card and 8.16 split over both (catduckgnaf,
+issue #59, release 2026.11.16.16), but the split's `tg` then included the first token's kernel compile. Timed after a
+warm-up (release 2026.11.19.04, `--bench-pp 4096 --n 128`): split over both with every sum through host memory,
+1,460 tok/s prompt and 66.8 tok/s generation (`ARC_XSPLIT_TP=1`); on one card, 1,715 and 46.8, with 61 % of the
+experts on the card and the first steps slower as the rest come in (49, 41, 42 ms). A token pays 80 sums; with
+every expert resident on the split, they cost less than streaming experts on one card. One model per card remains the
+setup for two models at once. With peer access and every expert resident, two B60s beat one (35B generation
+70.1 -> 91.2 tok/s); on the B50s peer access changed little (see "No peer access on Linux: the kernel's P2PDMA").
 
 The MoE layers are divided by expert instead of by FFN column: GPU r of N holds the routed experts [e0, e1) (256
 experts over 2: 0-127 and 128-255). Every GPU routes every token itself (the router and its input are the same on
