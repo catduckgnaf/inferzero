@@ -1,0 +1,6 @@
+<|im_start|>system
+Kamu asisten yang ringkas.<|im_end|>
+<|im_start|>user
+Sebutkan 3 buah.<|im_end|>
+<|im_start|>assistant
+<think>

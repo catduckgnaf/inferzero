@@ -452,7 +452,13 @@ inline uint4 pack_p(int q) {
   }
 #endif
 
-__attribute__((intel_reqd_sub_group_size(SG)))
+// (attn_q8 is compiled only where its work-group divides the K / V tile; elsewhere it is left out of the program. The
+//  ops parts build each kernel with the parts before it (zero/clrt.h KernelParts), so a later part's kernel, the
+//  vision encoder's vit_attn_rows with Qwen3-VL's 72-dim heads, compiled this one with HD 72 and the default
+//  work-group (16 x 2 x 8 = 256 items against 576 tile words): the #error that stood here failed that build and ended
+//  the server at the first image on a B70 (issue #70). The engine builds attn_q8 itself only with sizes that fit; a
+//  wrong one now fails as a kernel that is not in the program, still at once)
+//  (the macros the later kernels use too, QSA_ARGS / QSA_KEEP and NL, stay defined either way)
 #ifdef QSA  // Flash Next sparse attention: a query sees the keys of its selected blocks and of its tail block
 #define QSA_ARGS , __global const uint* qmask, int qmw
 // (block size QR; mask row `row`: bit b of word b / 32 = block b)
@@ -460,6 +466,12 @@ __attribute__((intel_reqd_sub_group_size(SG)))
 #else
 #define QSA_ARGS
 #endif
+#define NL (2 * BLK_U / (16 * NSP * TPW))  // (tile words a work-item fetches: whole where ATTN_Q8_FITS)
+#if (2 * BLK_U) % (16 * NSP * TPW) == 0
+#define ATTN_Q8_FITS 1
+#endif
+#ifdef ATTN_Q8_FITS
+__attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void attn_q8(__global const char* qi, __global const float* qsc, __global const uint* kq,
                       __global const float* ksc, __global const uint4* vq, __global const float* vsc, int cap,
                       int nh, int pos0, int M_valid, __global float* out, int win, int nc_lo, int nc_hi QSA_ARGS) {
@@ -505,10 +517,6 @@ __kernel void attn_q8(__global const char* qi, __global const float* qsc, __glob
   const size_t blk0 = (size_t)g * nbc;
   const int last_hi = (nc_hi >= 0 && first <= nc_hi && last >= nc_lo) ? max(last, nc_hi) : last;
   const int b_first = win > 0 ? max(0, first - win + 1) / 16 : 0, b_last = last_hi / 16;
-#define NL (2 * BLK_U / (16 * NSP * TPW))
-#if (2 * BLK_U) % (16 * NSP * TPW)
-#error "the work-group must divide the K / V tile (2 * BLK_U words): part of it would stay unloaded"
-#endif
   __global const uint* vqu = (__global const uint*)vq;
   uint rk[NL];
   {
@@ -585,6 +593,7 @@ __kernel void attn_q8(__global const char* qi, __global const float* qsc, __glob
     }
   }
 }
+#endif  // ATTN_Q8_FITS
 
 // Prefill attention for long prompts with the head dims split over sub-groups. As attn_q8, a work-group covers TPW
 // consecutive tokens of one kv head and shares every 16-key K/V tile through SLM; but a sub-group owns PTT tokens x
@@ -809,6 +818,9 @@ __kernel void attn_ps(__global const char* qi, __global const float* qsc, __glob
 // keys [max(lo(m), split start), min(pos0 + m, split end)]. Partial results (max, sum, unnormalized o) go to
 // part[((m * nsplit + split) * nh + h) * (HD + 2)]; attn_combine merges each row's splits.
 // grid (nsplit * 16*NSP*TPW, nkv), local (16*NSP*TPW, 1). kstart and slen: multiples of 16.
+// (as attn_q8, only where its work-group divides the tile: NL whole, or part of each tile would not be loaded; self
+//  audit 2026-11-21, the #error that had kept such builds out was dropped for issue #70)
+#ifdef ATTN_Q8_FITS
 __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void attn_split(__global const char* qi, __global const float* qsc, __global const uint* kq,
                          __global const float* ksc, __global const uint4* vq, __global const float* vsc, int cap,
@@ -890,6 +902,7 @@ __kernel void attn_split(__global const char* qi, __global const float* qsc, __g
     }
   }
 }
+#endif  // ATTN_Q8_FITS
 
 // Single-token attention split over the key range (flash-decoding): one sub-group per (key split, kv head,
 // head slice) computes, for HS q heads, the max score, softmax denominator and unnormalized P*V over its keys

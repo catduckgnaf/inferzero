@@ -23,7 +23,7 @@
 #                                     Transcripts / Meetings tabs, voice messages, /v1/audio/transcriptions
 #   zero-server start ... -DryRun      check the options, print the server's command line and a GPU memory estimate
 #   zero-server start -Preset work     the options saved with save-preset -Preset work (the command line wins)
-#   zero-server list | logs | doctor | version [-Check] | pull <keys> | presets | save-preset   (help: zero-server help)
+#   zero-server list | logs | doctor | version [-Check] | pull <keys> | presets | save-preset | options   (help: zero-server help)
 #
 # Exit codes: 0 ok, 1 a wrong option or value (the message says which), 2 the server stopped while loading,
 # 3 not ready within 10 minutes, 4 the port is used by another program.
@@ -34,7 +34,7 @@
 #      90 days / 200 MB at most)
 param(
   [ValidateSet("start", "stop", "status", "restart", "clear-cache", "record", "record-stop", "record-status", "list", "ls",
-    "logs", "log", "doctor", "version", "--version", "pull", "get", "presets", "save-preset", "pack", "remove-original", "help", "--help", "-h")] [string]$Action = "start",
+    "logs", "log", "doctor", "version", "--version", "pull", "get", "presets", "save-preset", "pack", "remove-original", "options", "help", "--help", "-h")] [string]$Action = "start",
   [string]$Model = "",
   [string]$Ctx = "",
   [int]$Chunk = 0,
@@ -82,7 +82,10 @@ param(
   [switch]$Follow,        # logs: keep printing new lines
   [int]$Lines = 40,       # logs: how many lines
   [switch]$Check,         # version: ask GitHub whether a newer package is out
-  [string]$Drafter = ""   # auto | mtp | dflash | off | <DFlash2 folder>
+  [string]$Drafter = "",  # auto | mtp | dflash | off | <DFlash2 folder>
+  [string[]]$Opt = @(),   # speed / accuracy options by id (scripts\options.tsv): on, kept for later starts; id=value for a value
+  [string[]]$NoOpt = @(), # the same, off (a default-on option: turned off); zero-server options lists them
+  [string[]]$DefaultOpt = @()  # the same, back to its default (the saved choice forgotten)
 )
 $ErrorActionPreference = "Stop"
 # (an option this script does not have went to $args and was ignored: "-Whispr on" started the server without
@@ -127,6 +130,76 @@ function Get-RecorderExe {
 }
 New-Item -ItemType Directory -Force $stateDir | Out-Null
 
+# ---- speed / accuracy options (QUEUE O2, 2026-11-21): the catalog scripts\options.tsv (one row an option: its id,
+# switch, values, default, plain title, what it does, the PCs it is for, its cost, same output or KL), the choices in
+# %USERPROFILE%\.inferzero\options.json ({"copy_draft": "on", "xcpu": "off", "budget": "12"}), kept for later starts.
+# -Opt id / -Opt id=value turns one on, -NoOpt id off (an option on by default: off), and `zero-server options` lists
+# them with what each does and whether it is for this PC. An env option goes into the server's environment, a flag
+# onto its command line
+$optCatalog = @()
+$optTsv = Join-Path $root "scripts\options.tsv"
+if (Test-Path -LiteralPath $optTsv) {
+  $ol = [IO.File]::ReadAllText($optTsv, (New-Object Text.UTF8Encoding $false)) -split "\r?\n" | Where-Object { $_ -ne "" }
+  $oc = $ol[0] -split "`t"
+  $optCatalog = @(foreach ($l in $ol[1..($ol.Count - 1)]) {
+    $v = $l -split "`t"; $d = [ordered]@{}
+    for ($i = 0; $i -lt $oc.Count; $i++) { $d[$oc[$i]] = $(if ($i -lt $v.Count) { $v[$i] } else { "" }) }
+    [pscustomobject]$d
+  })
+}
+$optFile = Join-Path $stateDir "options.json"
+$optChoice = [ordered]@{}
+if (Test-Path -LiteralPath $optFile) {
+  try { (Get-Content -Encoding UTF8 -LiteralPath $optFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $optChoice[$_.Name] = "$($_.Value)" } }
+  catch { Write-Host "zero-server: $optFile is not valid JSON: the options in it are not used" -ForegroundColor Yellow }
+}
+function Find-Opt([string]$id) {
+  $o = @($optCatalog | Where-Object { $_.id -eq $id })[0]
+  if (-not $o) { throw "zero-server: no option '$id' (the options: $(($optCatalog | ForEach-Object { $_.id }) -join ', '); zero-server options)" }
+  return $o
+}
+$optChanged = $false
+foreach ($s in @($Opt | ForEach-Object { "$_" -split ',' } | Where-Object { $_ })) {
+  $id, $val = $s.Trim() -split '=', 2
+  $o = Find-Opt $id
+  if ($o.on -match '^<' -and -not $val) { throw "-Opt ${id}: give its value, e.g. -Opt $id=12 ($($o.on))" }
+  $optChoice[$o.id] = if ($val) { $val.Trim() } else { "on" }
+  $optChanged = $true
+}
+foreach ($s in @($NoOpt | ForEach-Object { "$_" -split ',' } | Where-Object { $_ })) {
+  $o = Find-Opt $s.Trim()
+  $optChoice[$o.id] = "off"
+  $optChanged = $true
+}
+foreach ($s in @($DefaultOpt | ForEach-Object { "$_" -split ',' } | Where-Object { $_ })) {
+  $o = Find-Opt $s.Trim()
+  if ($optChoice.Contains($o.id)) { $optChoice.Remove($o.id) }
+  $optChanged = $true
+}
+if ($optChanged -and -not $DryRun) { [IO.File]::WriteAllText($optFile, ($optChoice | ConvertTo-Json), (New-Object Text.UTF8Encoding $false)) }
+# the environment variables and serverz flags the choices make (a choice for an option no longer in the catalog: left out)
+function Opt-Effect {
+  $envs = [ordered]@{}; $flags = @(); $words = @()
+  foreach ($k in $optChoice.Keys) {
+    $o = @($optCatalog | Where-Object { $_.id -eq $k })[0]
+    if (-not $o) { continue }
+    $c = $optChoice[$k]
+    if ($c -eq "off") {
+      if ($o.kind -eq "env" -and $o.off -ne "") { $envs[$o.name] = $o.off; $words += "$($o.title): off" }
+      continue
+    }
+    $val = if ($c -eq "on") { $o.on } else { $c }
+    if ($o.kind -eq "env") { $envs[$o.name] = $val }
+    elseif ($o.on -ne "") { $flags += @($o.name, $val) }
+    else { $flags += $o.name }
+    $words += "$($o.title)$(if ($c -ne 'on') { " ($c)" })"
+  }
+  return @{ envs = $envs; flags = $flags; words = $words }
+}
+# which kinds of PC this one is (the catalog's best_for words): scripts\pc-kinds.ps1, shared with the launcher
+. (Join-Path $PSScriptRoot "pc-kinds.ps1")
+function PC-Kinds { Get-PcKinds }
+
 # ---- presets: %USERPROFILE%\.inferzero\presets\<name>.json, {"Model": "35b", "Ctx": "65536", "Npu": "on", "NoMtp": true}:
 # zero-server's own option names (the launcher's "Save as preset" writes the same). start -Preset <name> takes them;
 # an option given on the command line wins over the preset's.
@@ -143,7 +216,7 @@ function Preset-Path([string]$n) {
 if ($Preset -and $Action -in "start", "restart") {
   $pp = Preset-Path $Preset
   if (-not (Test-Path -LiteralPath $pp)) { throw "-Preset: no preset '$Preset' ($pp); zero-server presets lists them" }
-  try { $po = Get-Content -LiteralPath $pp -Raw | ConvertFrom-Json } catch { throw "preset '$Preset' ($pp) is not valid JSON: $($_.Exception.Message)" }
+  try { $po = Get-Content -Encoding UTF8 -LiteralPath $pp -Raw | ConvertFrom-Json } catch { throw "preset '$Preset' ($pp) is not valid JSON: $($_.Exception.Message)" }
   foreach ($p in $po.PSObject.Properties) {
     $k = @($presetKeys | Where-Object { $_ -eq $p.Name })[0]  # (the script's spelling: -eq ignores case)
     if (-not $k) { throw "preset '$Preset': unknown option '$($p.Name)' ($pp)" }
@@ -251,7 +324,7 @@ function Stop-Arc {
   # the restart loads it instead of processing it again
   try { $null = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$Port/sessions/save" -TimeoutSec 60 } catch {}
   if (Test-Path $stateFile) {
-    $st = Get-Content $stateFile -Raw | ConvertFrom-Json
+    $st = Get-Content -Encoding UTF8 $stateFile -Raw | ConvertFrom-Json
     # (only the server of this port: -Port 8091 left the 8090 one, which the state file describes, running)
     if (-not $st.port -or "$($st.port)" -eq "$Port") {
       $p = Get-Process -Id $st.pid -ErrorAction SilentlyContinue
@@ -414,6 +487,9 @@ Options for start / restart:
                                  off (= -NoMtp), or a DFlash2 drafter's folder (= -DFlash <folder>)
   -DryRun                        check everything, print the serverz.exe command line and a GPU memory estimate
                                  (with -Json as JSON), and start or stop nothing
+  -Opt <id>[=value][,<id>...]    turn speed / accuracy options on (copy_draft, batch, xcpu, ...; kept for later
+                                 starts); -NoOpt <id> off, -DefaultOpt <id> back to its default. zero-server options lists them, what each does and
+                                 whether it is for this PC (docs\options.md)
   -Ctx <N|auto>                  context in tokens, or auto = the largest that fits the GPU memory currently
                                  set, less 0.5 GiB for the driver (computed on the first start
                                  of a model, remembered, recomputed when the GPU memory changes). Not given:
@@ -570,7 +646,7 @@ function Get-Version {
   $pb = Join-Path $root "bin\PREBUILT.txt"
   $v = [ordered]@{ version = ""; commit = ""; built = ""; prebuilt = (Test-Path $pb); folder = $root }
   if ($v.prebuilt) {
-    $l = (Get-Content $pb -TotalCount 1).Trim()
+    $l = (Get-Content -Encoding UTF8 $pb -TotalCount 1).Trim()
     if ($l -match '^(?:arc)?inferzero (\S+) \(built ([^,]+), commit (\w+)\)') { $v.version = $Matches[1]; $v.built = $Matches[2]; $v.commit = $Matches[3] }
   } else {
     try {
@@ -646,7 +722,7 @@ switch ($Action) {
     $servers = @(Get-CimInstance Win32_Process -Filter "Name='serverz.exe'" -ErrorAction SilentlyContinue |
                  Where-Object { "$($_.CommandLine)" -notmatch '\s--(list-models|pack)(\s|$)' })
     if ($servers.Count) {
-      $cur = if (Test-Path $stateFile) { try { Get-Content $stateFile -Raw | ConvertFrom-Json } catch { $null } } else { $null }
+      $cur = if (Test-Path $stateFile) { try { Get-Content -Encoding UTF8 $stateFile -Raw | ConvertFrom-Json } catch { $null } } else { $null }
       $run = Get-Running
       if ($all.Count -eq 0) { $all = Get-ModelsListed }
       $ids = @($all | Where-Object { Same-Path $_.path $src } | ForEach-Object { $_.alias })
@@ -668,14 +744,14 @@ switch ($Action) {
     #  would load the original, or after remove-original find nothing)
     $toPackage = {
       if ((Test-Path -LiteralPath $lastFile) -and (Test-Path -LiteralPath $pkgGguf)) {
-        $l = "$(Get-Content -LiteralPath $lastFile -Raw)".Trim()
+        $l = "$(Get-Content -Encoding UTF8 -LiteralPath $lastFile -Raw)".Trim()
         if ($l -and (Same-Path $l $src)) { Set-Content -LiteralPath $lastFile $pkgGguf -Encoding utf8; Say "the default model is now its package" }
       } }
     # (the file the package was made from, written by serverz --pack (zero/gguf_pack.h); not the folder's source.txt,
     #  which names the GGUF whose expert file is kept there and is rewritten by any same-named one loaded from elsewhere)
     $madeFrom = {
       $rec = Join-Path $pkgDir "package-source.txt"
-      if (Test-Path -LiteralPath $rec) { "$(Get-Content -LiteralPath $rec | Select-Object -First 1)".Trim() } else { "" } }
+      if (Test-Path -LiteralPath $rec) { "$(Get-Content -Encoding UTF8 -LiteralPath $rec | Select-Object -First 1)".Trim() } else { "" } }
     if ($Action -eq "remove-original") {
       if (-not ((Test-Path -LiteralPath $pkgGguf) -and (Test-Path -LiteralPath $pkgExp))) {
         throw "remove-original: no complete package of $leaf ($pkgGguf and its .experts): zero-server pack -Model it first"
@@ -772,8 +848,8 @@ switch ($Action) {
   }
   { $_ -in "logs", "log" } {
     if (-not (Test-Path $log)) { Say "No log yet ($log): the server has not been started."; return }
-    if ($Follow) { Get-Content -LiteralPath $log -Tail ([math]::Max(1, $Lines)) -Wait }
-    else { Get-Content -LiteralPath $log -Tail ([math]::Max(1, $Lines)) }
+    if ($Follow) { Get-Content -Encoding UTF8 -LiteralPath $log -Tail ([math]::Max(1, $Lines)) -Wait }
+    else { Get-Content -Encoding UTF8 -LiteralPath $log -Tail ([math]::Max(1, $Lines)) }
     return
   }
   { $_ -in "version", "--version" } {
@@ -807,10 +883,35 @@ switch ($Action) {
     Write-Host "Done. Start it: zero-server start -Model $($keys[0])"
     return
   }
+  "options" {
+    # every option of scripts\options.tsv: its state (on / off as chosen, or the default), whether it is for this PC
+    $kinds = PC-Kinds
+    $list = foreach ($o in $optCatalog) {
+      $c = if ($optChoice.Contains($o.id)) { $optChoice[$o.id] } else { "" }
+      $fit = @($o.best_for -split ';' | Where-Object { $_ -in "alchemist", "b-series", "igpu-xe2", "igpu-140t", "igpu-xe-lpg", "multi-gpu" })
+      $for = if (-not $fit.Count) { "any" } elseif (@($fit | Where-Object { $_ -in $kinds }).Count) { "this PC" } else { "not this PC (" + ($fit -join ", ") + ")" }
+      [ordered]@{ id = $o.id; state = $(if ($c) { $c } else { "default" }); default = $o.default; title = $o.title; what = $o.what;
+        how = $(if ($o.kind -eq "env") { "$($o.name)=$($o.on)" } else { "$($o.name) $($o.on)".Trim() }); for = $for; output = $o.output;
+        cost = $o.cost; measured = $o.measured; status = $o.status }
+    }
+    if ($Json) { Out-Json @{ pc = $kinds; options = @($list); file = $optFile }; return }
+    if (-not $optCatalog.Count) { Write-Host "No option catalog ($optTsv)."; return }
+    Write-Host "Speed and accuracy options (this PC: $(if ($kinds.Count) { $kinds -join ', ' } else { 'not recognized' })):"
+    foreach ($e in $list) {
+      $mark = switch ($e.state) { "default" { " " } "off" { "-" } default { "+" } }
+      Write-Host ("{0} {1,-11} {2}  [{3}; {4}; {5}]" -f $mark, $e.id, $e.title, $(if ($e.state -eq "default") { "default: $($e.default)" } else { $e.state }),
+        $(if ($e.output -eq "same") { "same output" } else { "output checked (KL)" }), $e.for)
+      Write-Host ("               {0}. Cost: {1}." -f $e.what, $e.cost) -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    Write-Host "Turn one on: zero-server start -Opt <id> (kept for later starts); off: -NoOpt <id>; the details: docs\options.md"
+    if ($optChanged) { Write-Host "Saved in $optFile. A running server takes them at its next start (zero-server restart)." -ForegroundColor Yellow }
+    return
+  }
   "presets" {
     $ps = @(Get-ChildItem -LiteralPath $presetDir -Filter *.json -ErrorAction SilentlyContinue | Sort-Object Name)
     $out = [ordered]@{}
-    foreach ($f in $ps) { try { $out[$f.BaseName] = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { $out[$f.BaseName] = "not valid JSON" } }
+    foreach ($f in $ps) { try { $out[$f.BaseName] = Get-Content -Encoding UTF8 -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { $out[$f.BaseName] = "not valid JSON" } }
     if ($Json) { Out-Json $out; return }
     if (-not $ps.Count) { Write-Host "No presets yet. Save one: zero-server save-preset -Preset <name> -Model 35b -Ctx 65536 ..."; return }
     foreach ($k in $out.Keys) {
@@ -858,7 +959,14 @@ switch ($Action) {
     }
     try {
       $gpus = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match "Intel" })
-      foreach ($g in $gpus) { Add-Check "gpu" "ok" "$($g.Name), driver $($g.DriverVersion) ($("{0:yyyy-MM-dd}" -f $g.DriverDate))" }
+      foreach ($g in $gpus) {
+        Add-Check "gpu" "ok" "$($g.Name), driver $($g.DriverVersion) ($("{0:yyyy-MM-dd}" -f $g.DriverDate))"
+        # (the engine's own threshold, zero/clrt.h: older Intel drivers gave wrong answers, 2026-11-20)
+        $dv = $null
+        if ($g.Name -match 'Intel' -and [version]::TryParse("$($g.DriverVersion)", [ref]$dv) -and $dv -lt [version]"32.0.101.8976") {
+          Add-Check "driver" "FAIL" "$($g.Name): driver $($g.DriverVersion) is older than 32.0.101.8976, the oldest measured right: answers may be wrong. Install Intel's current Arc / Core Ultra graphics driver (Windows Update can put an old one back)"
+        }
+      }
       if (-not $gpus.Count) { Add-Check "gpu" "FAIL" "no Intel GPU in Windows' list of display adapters" }
     } catch {}
     $ci = Join-Path $root "bin\clinfo.exe"
@@ -896,6 +1004,7 @@ switch ($Action) {
       $pr = $null; try { $pr = Invoke-RestMethod "$base/props" -TimeoutSec 3 } catch {}
       $mt = if ($pr -and $pr.memory) { ", GPU memory {0:N1} of {1:N1} GiB" -f ($pr.memory.total / 1GB), ($pr.memory.device / 1GB) } else { "" }
       Add-Check "server" "ok" "running on $base, model $run$(if ($pr) { ", context $($pr.n_ctx)" })$mt"
+      if ($pr -and $pr.driver_warning) { Add-Check "driver" "FAIL" $pr.driver_warning }  # (the server's own check, 2026-11-20)
     } else {
       Add-Check "server" "info" "not running on port $Port"
       try {
@@ -909,7 +1018,7 @@ switch ($Action) {
     $onPath = [bool](Get-Command zero-server -ErrorAction SilentlyContinue)
     Add-Check "commands" $(if ($onPath) { "ok" } else { "info" }) $(if ($onPath) { "zero-server is on PATH" } else { "zero-server is not on PATH: run it as $root\zero-server.cmd (setup offers to add the folder)" })
     if (Test-Path $log) {
-      $errs = @(Get-Content -LiteralPath $log -Tail 400 -ErrorAction SilentlyContinue | Where-Object { $_ -match '(?i)error|device lost|failed|out of memory' } | Select-Object -Last 5)
+      $errs = @(Get-Content -Encoding UTF8 -LiteralPath $log -Tail 400 -ErrorAction SilentlyContinue | Where-Object { $_ -match '(?i)error|device lost|failed|out of memory' } | Select-Object -Last 5)
       foreach ($e in $errs) { Add-Check "log" "warn" $e }
     }
     if ($Json) { Out-Json $rep.ToArray(); return }  # (@($rep) on a List: "Argument types do not match" in PowerShell 5.1)
@@ -929,7 +1038,7 @@ switch ($Action) {
     if ($Json) {
       $o = [ordered]@{ running = [bool]$id; base = $base; port = $Port; model = $id; props = $null; state = $null }
       if ($id) { try { $o.props = Invoke-RestMethod "$base/props" -TimeoutSec 2 } catch {} }
-      if ($id -and (Test-Path $stateFile)) { try { $o.state = Get-Content $stateFile -Raw | ConvertFrom-Json } catch {} }
+      if ($id -and (Test-Path $stateFile)) { try { $o.state = Get-Content -Encoding UTF8 $stateFile -Raw | ConvertFrom-Json } catch {} }
       $files = @(Get-ChildItem $sessDir -Recurse -Filter *.arcs -ErrorAction SilentlyContinue)
       $o.saved_conversations = [ordered]@{ count = $files.Count; bytes = [double](($files | Measure-Object Length -Sum).Sum); folder = $sessDir }
       Out-Json $o
@@ -938,15 +1047,16 @@ switch ($Action) {
     if ($id) {
       $p = Invoke-RestMethod "$base/props" -TimeoutSec 2
       Say "inferzero server running on $base : model $id"
-      if (Test-Path $lastFile) { Say ("  " + (Get-Content $lastFile -Raw).Trim()) }  # (also after switching in Pi)
+      if ($p.driver_warning) { Write-Host "  WARNING: $($p.driver_warning)" -ForegroundColor Yellow }  # (2026-11-20)
+      if (Test-Path $lastFile) { Say ("  " + (Get-Content -Encoding UTF8 $lastFile -Raw).Trim()) }  # (also after switching in Pi)
       Say ("  " + ($p | ConvertTo-Json -Compress -Depth 3))
-      if ((Test-Path $stateFile) -and "$((Get-Content $stateFile -Raw | ConvertFrom-Json).extra)" -match "--npu on") {
+      if ((Test-Path $stateFile) -and "$((Get-Content -Encoding UTF8 $stateFile -Raw | ConvertFrom-Json).extra)" -match "--npu on") {
         Say "  NPU: on (-Npu on; kept when the model changes and on a restart, off after stop)"
       }
-      if ((Test-Path $stateFile) -and "$((Get-Content $stateFile -Raw | ConvertFrom-Json).extra)" -match "--precise") {
+      if ((Test-Path $stateFile) -and "$((Get-Content -Encoding UTF8 $stateFile -Raw | ConvertFrom-Json).extra)" -match "--precise") {
         Say "  precise mode: on (-Precise; Flash Next; kept like -Npu, -NoPrecise turns it off)"
       }
-      if ((Test-Path $stateFile) -and ($c = (Get-Content $stateFile -Raw | ConvertFrom-Json).cmd)) { Say "  command: $c" }
+      if ((Test-Path $stateFile) -and ($c = (Get-Content -Encoding UTF8 $stateFile -Raw | ConvertFrom-Json).cmd)) { Say "  command: $c" }
     } else { Say "inferzero server is not running." }
     $files = @(Get-ChildItem $sessDir -Recurse -Filter *.arcs -ErrorAction SilentlyContinue)
     Say ("Saved conversations: {0} ({1:N1} GiB) in {2}" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1GB), $sessDir)
@@ -974,8 +1084,8 @@ switch ($Action) {
     $log = Join-Path $stateDir "recorder.log"
     $p = Start-Process $rec -ArgumentList $a -WindowStyle Hidden -PassThru -RedirectStandardError $log
     Start-Sleep -Milliseconds 1500
-    if ($p.HasExited) { Get-Content $log | ForEach-Object { Say $_ }; throw "the recorder did not start" }
-    Get-Content $log | ForEach-Object { Say $_ }
+    if ($p.HasExited) { Get-Content -Encoding UTF8 $log | ForEach-Object { Say $_ }; throw "the recorder did not start" }
+    Get-Content -Encoding UTF8 $log | ForEach-Object { Say $_ }
     Say "zero-server record-stop ends it."
     return
   }
@@ -986,7 +1096,7 @@ switch ($Action) {
 # ---- start / restart
 if (-not (Test-Path $exe)) { throw "$exe not found: build it with .\build.ps1 zero\serverz.cpp (or run setup)" }
 $running = Get-Running
-$st = if ($running -and (Test-Path $stateFile)) { Get-Content $stateFile -Raw | ConvertFrom-Json } else { $null }
+$st = if ($running -and (Test-Path $stateFile)) { Get-Content -Encoding UTF8 $stateFile -Raw | ConvertFrom-Json } else { $null }
 $models = Get-Models
 # -Model none: speech to text only (Qwen3-ASR; -Whisper auto for Whisper too), a chat model loaded later by the first
 # chat request naming one (the web UI's model menu)
@@ -1005,7 +1115,7 @@ if ($Model -eq "none" -or (-not $Model -and $Action -eq "restart" -and $running 
   $noConsole = [Console]::IsInputRedirected -or (@([Environment]::GetCommandLineArgs()) -match '^-noni').Count -gt 0
   if ($noConsole) {
     if ($running) { Say "No -Model given: keeping $running."; return }
-    $lp = if (Test-Path $lastFile) { (Get-Content $lastFile -Raw).Trim() } else { "" }
+    $lp = if (Test-Path $lastFile) { (Get-Content -Encoding UTF8 $lastFile -Raw).Trim() } else { "" }
     $m = if ($lp) { $models | Where-Object { $_.supported -and (Same-Path $_.path $lp) } | Select-Object -First 1 } else { $null }
     if (-not $m) { throw "No -Model given and no console to choose one in: zero-server start -Model <shortcut, id or file> (run 'zero-server start' in a console for the list)" }
     Say "No -Model given: starting the model used last, $($m.alias)"
@@ -1117,10 +1227,14 @@ if ($NoSwap) { $extra += "--no-swap" }
 if ($ListenHost) { $extra += @("--host", $ListenHost) }
 if ($SessionDir) { $extra += @("--session-dir", "`"$SessionDir`"") }
 if ($NoStream) { $extra += "--no-stream" }  # (in the key: a running server with the SSD cache is restarted without it)
-$extraKey = "$($extra -join ' ')|think $ThinkBudget"
+# (the chosen speed / accuracy options: flags here, environment variables just before the server starts; both in the
+#  key, so a changed choice restarts a running server)
+$optFx = Opt-Effect
+$extra += $optFx.flags
+$extraKey = "$($extra -join ' ')|think $ThinkBudget$(if ($optFx.envs.Count) { '|env ' + (($optFx.envs.Keys | ForEach-Object { "$_=$($optFx.envs[$_])" }) -join ' ') })"
 # (compared with the running server's only when given: zero-pi's plain start keeps a server started with other options)
 $extraGiven = @("MtpDrafts", "DFlash", "DriverReserveGb", "ThinkBudget", "ImageMinTokens", "ImageMaxTokens", "BudgetGb", "AttnF32", "PreserveThinking", "NoPrefixCache",
-  "PrefixCacheGb", "NoSwap", "ListenHost", "SessionDir", "Slots", "Gpus", "NoStream", "Npu", "Precise", "NoPrecise", "Whisper", "WhisperDevice", "Asr", "AsrSlots", "WhisperMaxMinutes" | Where-Object { $PSBoundParameters.ContainsKey($_) }).Count -gt 0
+  "PrefixCacheGb", "NoSwap", "ListenHost", "SessionDir", "Slots", "Gpus", "NoStream", "Npu", "Precise", "NoPrecise", "Whisper", "WhisperDevice", "Asr", "AsrSlots", "WhisperMaxMinutes", "Opt", "NoOpt", "DefaultOpt" | Where-Object { $PSBoundParameters.ContainsKey($_) }).Count -gt 0
 # the running server is kept unless an option given now differs from what it runs with (empty / 0 = not given)
 $same = $running -eq $m.alias -and (-not $Ctx -or ($st -and "$($st.ctx)" -eq $ctxArg)) -and
   ($Chunk -eq 0 -or ($st -and "$($st.chunk)" -eq "$Chunk")) -and (-not $PSBoundParameters.ContainsKey("SessionCacheGb") -or ($st -and "$($st.sess)" -eq "$SessionCacheGb")) -and
@@ -1178,6 +1292,8 @@ if ($DryRun) {
   }
   Say "Dry run: would $what with $($m.alias), context $ctxArg, port $Port"
   Say "  command: $srvCmd"
+  if ($optFx.envs.Count) { Say "  environment: $(($optFx.envs.Keys | ForEach-Object { "$_=$($optFx.envs[$_])" }) -join ' ')" }
+  if ($optFx.words.Count) { Say "  options: $($optFx.words -join ', ')" }
   Say "  $(Est-Text $est)"
   return
 }
@@ -1261,8 +1377,16 @@ if (Test-Path -LiteralPath $log) {
     }
   } catch {}
 }
-$p = Start-Process -FilePath $exe -ArgumentList $srvArgs -WorkingDirectory $root -WindowStyle Hidden -PassThru `
-  -RedirectStandardError $log -RedirectStandardOutput (Join-Path $stateDir "server.out.log")
+# (the chosen options' environment variables: in this process only while the server starts, which inherits them)
+$envBefore = @{}
+foreach ($k in $optFx.envs.Keys) { $envBefore[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item "Env:$k" $optFx.envs[$k] }
+if ($optFx.words.Count) { Say "  options: $($optFx.words -join ', ')" }
+try {
+  $p = Start-Process -FilePath $exe -ArgumentList $srvArgs -WorkingDirectory $root -WindowStyle Hidden -PassThru `
+    -RedirectStandardError $log -RedirectStandardOutput (Join-Path $stateDir "server.out.log")
+} finally {
+  foreach ($k in $envBefore.Keys) { if ($null -eq $envBefore[$k]) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue } else { Set-Item "Env:$k" $envBefore[$k] } }
+}
 if ($m -ne $none) { Set-Content $lastFile $m.path -Encoding utf8 }  # (none: the chat model used last stays the default)
 @{ pid = $p.Id; engine = $Engine; model = $m.name; path = $m.path; alias = $m.alias; ctx = $ctxArg; chunk = $(if ($Chunk -gt 0) { "$Chunk" } else { "default" }); sess = "$SessionCacheGb"; novision = $novision; extra = $extraKey; port = $Port; cmd = $srvCmd; started = (Get-Date).ToString("s") } |
   ConvertTo-Json | Set-Content $stateFile -Encoding utf8
@@ -1274,7 +1398,7 @@ $script:lastProgress = $null  # (kept: more than 40 other lines after it would h
 $showBar = -not [Console]::IsOutputRedirected  # (the launcher runs this hidden, its output in a file: its own bar)
 function Show-LoadProgress {
   if (-not $showBar) { return }
-  $line = Get-Content $log -Tail 40 -ErrorAction SilentlyContinue | Where-Object { $_ -match '^progress: ' } | Select-Object -Last 1
+  $line = Get-Content -Encoding UTF8 $log -Tail 40 -ErrorAction SilentlyContinue | Where-Object { $_ -match '^progress: ' } | Select-Object -Last 1
   if ($line) { $script:lastProgress = $line } else { $line = $script:lastProgress }
   $secs = [int]((Get-Date) - $t0).TotalSeconds
   if ($line -match '^progress: (-?\d+) % (.*)$') {
@@ -1291,7 +1415,7 @@ while ($true) {
   if ($p.HasExited) {
     Write-Progress -Activity $barActivity -Completed
     Write-Host "The server stopped while loading. Last log lines:" -ForegroundColor Red
-    Get-Content $log -Tail 60 | Where-Object { $_ -notmatch '^progress: ' } | Select-Object -Last 15 | ForEach-Object { Write-Host "  $_" }
+    Get-Content -Encoding UTF8 $log -Tail 60 | Where-Object { $_ -notmatch '^progress: ' } | Select-Object -Last 15 | ForEach-Object { Write-Host "  $_" }
     Remove-Item $stateFile -Force -ErrorAction SilentlyContinue
     exit 2
   }
@@ -1314,7 +1438,7 @@ if ($true) {
   # the engine's own lines: the expert cache (MoE) or that the model has no experts to stream
   # (the log's prefix, docs/logging.md: "2026-11-12 14:13:05.123 I ", or "I " without the time)
   $pre = '^(?:(?:\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} )?[EWID] )?'
-  $zl = @(Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match "$pre(?:arc)?inferzero: (expert cache|cache filled|expert file written|memory limit)" })
+  $zl = @(Get-Content -Encoding UTF8 $log -ErrorAction SilentlyContinue | Where-Object { $_ -match "$pre(?:arc)?inferzero: (expert cache|cache filled|expert file written|memory limit)" })
   if ($zl.Count) {
     foreach ($l in $zl) { Say ("  " + ($l -replace "$pre(?:arc)?inferzero: ", "") -replace ", file .*$", "") }
   } elseif (-not $NoStream) {

@@ -84,7 +84,7 @@ foreach ($engine in $Engines) {
   # ---------------------------------------------------------------- time to first token on real prompts
   if ($Tests -contains "ttft") {
     foreach ($pf in $PromptFiles) {
-      $ids = (Get-Content $pf -Raw).Trim()
+      $ids = (Get-Content -Encoding UTF8 $pf -Raw).Trim()
       $n = ($ids -split ",").Count
       $tag = [IO.Path]::GetFileNameWithoutExtension($pf) -replace "\.ids$", ""
       Cool

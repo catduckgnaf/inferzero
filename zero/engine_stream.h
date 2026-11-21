@@ -212,6 +212,7 @@
     snprintf(h, sizeof h, "\nhost: routing reads %.0f ms (waiting for the GPU), ensure %.0f ms, PLE rows %.0f ms",
              hst_sync_ms_, hst_ensure_ms_, hst_ple_ms_);
     std::string out = r + h;
+    if (const std::string xh = x.xhist_line(); !xh.empty()) out += "\n" + xh;  // (ARC_XHIST, zero/xcache.h)
     if (xcpu_n_) {  // (ARC_XCPU, zero/xe2/engine_xcpu.h)
       char c[260];
       snprintf(c, sizeof c, "\nCPU experts (ARC_XCPU): %llu computed (%llu from RAM), %.0f ms (%.3f ms an expert, %d threads); cache fills %llu (%llu dropped); host: input reads %.0f ms, fills %.0f ms",
@@ -298,13 +299,13 @@
       L.rgu.role = kRoles - 1;
       L.rgu.raw = upload_padded(GGML_Q8_0, cat.data(), cat.size());
       has_rgu_ = true;
-      auto view = [&](int row0, int N) {
+      auto view = [&](int row0, int N, int role) {
         GpuWeight w;
         w.type = GGML_Q8_0;
         w.gemm_qtype = (int)GGML_Q8_0;  // (prompt chunks: decoded just in time, as make_weight does for MoE models)
         w.N = N;
         w.K = E;
-        w.role = kRoles - 1;
+        w.role = role;  // (a slot each: kept decoded through a layer-major segment, weight_role)
         stage_need_q_[w.role] = std::max(stage_need_q_[w.role], w8_bytes_q(N, E));
         stage_need_h_[w.role] = std::max(stage_need_h_[w.role], w8_bytes_h(N, E));
         if (L.rgu.raw) {  // (+kRawSlack: the GEMV's block reads run past a row's end, up to BBP + 63 bytes for an odd
@@ -317,11 +318,11 @@
         }
         return w;
       };
-      L.router = view(0, NR);
-      L.gate_sh = view(NRP, Fs);
-      L.up_sh = view(NRP + Fs, Fs);
+      L.router = view(0, NR, weight_role(p + "ffn_gate_inp.weight"));
+      L.gate_sh = view(NRP, Fs, weight_role(p + "ffn_gate_shexp.weight"));
+      L.up_sh = view(NRP + Fs, Fs, weight_role(p + "ffn_up_shexp.weight"));
     } else {
-      L.router = make_weight(GGML_Q8_0, q8.data(), q8.size(), NR, E);
+      L.router = make_weight(GGML_Q8_0, q8.data(), q8.size(), NR, E, weight_role(p + "ffn_gate_inp.weight"));
       L.gate_sh = load_w_pad(p + "ffn_gate_shexp.weight", Fs);
       L.up_sh = load_w_pad(p + "ffn_up_shexp.weight", Fs);
     }

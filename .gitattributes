@@ -1,2 +1,4 @@
 # shell scripts run on Linux: LF line endings whatever core.autocrlf says
 *.sh text eol=lf
+# the chat goldens are compared byte for byte (tests/test_chat_golden.ps1): never convert their line endings
+tests/chat_golden/** -text

@@ -347,7 +347,12 @@ class VisionGemma4V : public GemmaImageEncoder {
     cap_tok_ = std::max(cap_tok_, Mq);
   }
   cl_kernel kern(const char* name, const std::string& defs) { return e_.kernel("ops", "-DVIT " + defs, name); }
+  bool path_said_ = false;  // (E0: the GEMM path's log line written)
   void gemm(cl_mem A, int lda, const FW& w, cl_mem C, int ldc, int c_off, bool acc, int M, int n) {
+    if (!path_said_) {  // (E0, 2026-11-21: what this encoder's GEMMs run on, said once)
+      path_said_ = true;
+      zlog::eprintf("inferzero: the vision encoder (Gemma 4): %s\n", w.q8.raw ? (std::string("int8 GEMMs on the prompt GEMM (") + e_.gemm_path_name(w.q8.gemm_qtype) + ")").c_str() : "f16 GEMMs (vit_gemm_f16, no XMX)");
+    }
     if (w.q8.raw) {  // the engine's int8 GEMM, rows in equal chunks of at most its chunk size (its activation buffers)
       const int nch = (n + e_.max_chunk - 1) / e_.max_chunk, rows = ((n + nch - 1) / nch + 127) / 128 * 128;
       cl_kernel kq = kern("vit_quant_pad", "");

@@ -20,7 +20,7 @@ enum GgmlType : uint32_t {
   GGML_Q8_1 = 9, GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14,
   GGML_Q8_K = 15, GGML_IQ2_XXS = 16, GGML_IQ2_XS = 17, GGML_IQ3_XXS = 18, GGML_IQ1_S = 19, GGML_IQ4_NL = 20,
   GGML_IQ3_S = 21, GGML_IQ2_S = 22, GGML_IQ4_XS = 23, GGML_I8 = 24, GGML_I16 = 25, GGML_I32 = 26, GGML_IQ1_M = 29,
-  GGML_BF16 = 30, GGML_MXFP4 = 39,
+  GGML_BF16 = 30, GGML_TQ1_0 = 34, GGML_TQ2_0 = 35, GGML_MXFP4 = 39,
   // Unsloth's llama.cpp fork for DeepSeek-V4.1 (its Engram table): 32 E4M3 (fn) values sharing one E8M0 scale, 33
   // bytes. Upstream ggml gives 43 to plain F8_E4M3 (1 byte a value, no scale), which no model this engine runs uses.
   GGML_MXFP8 = 43,
@@ -40,7 +40,9 @@ inline const char* ggml_type_name(uint32_t t) {
     case GGML_IQ2_XXS: return "IQ2_XXS"; case GGML_IQ2_XS: return "IQ2_XS"; case GGML_IQ3_XXS: return "IQ3_XXS";
     case GGML_IQ1_S: return "IQ1_S"; case GGML_IQ3_S: return "IQ3_S"; case GGML_IQ2_S: return "IQ2_S"; case GGML_IQ1_M: return "IQ1_M";
     case GGML_AR4_128: return "AR4_128";
-    case GGML_MXFP4: return "MXFP4"; case GGML_MXFP8: return "MXFP8"; case GGML_Q2_0: return "Q2_0"; default: return "?";
+    case GGML_MXFP4: return "MXFP4"; case GGML_MXFP8: return "MXFP8"; case GGML_Q2_0: return "Q2_0";
+    case GGML_Q8_1: return "Q8_1"; case GGML_Q8_K: return "Q8_K"; case GGML_TQ1_0: return "TQ1_0"; case GGML_TQ2_0: return "TQ2_0";
+    default: return "?";
   }
 }
 
@@ -74,6 +76,12 @@ inline void ggml_block_info(uint32_t t, int& blk, int& bytes) {
     case GGML_MXFP4: blk = 32; bytes = 17; return;
     case GGML_MXFP8: blk = 32; bytes = 33; return;
     case GGML_Q2_0: blk = 64; bytes = 18; return;
+    // (known so a file holding them opens; Q8_1 decodes on the CPU at load, Q8_K / TQ1_0 / TQ2_0 are named in the error
+    //  when a weight of theirs is used: QUEUE Q2 / Q4, 2026-11-21)
+    case GGML_Q8_1: blk = 32; bytes = 36; return;
+    case GGML_Q8_K: blk = 256; bytes = 292; return;
+    case GGML_TQ1_0: blk = 256; bytes = 54; return;
+    case GGML_TQ2_0: blk = 256; bytes = 66; return;
     default: throw std::runtime_error("unsupported ggml type " + std::to_string(t));
   }
 }
@@ -190,6 +198,20 @@ class GgufFile {
     if (base_ && q >= base_ && n <= size_ && (uint64_t)(q - base_) <= size_ - n) return true;
     for (const auto& f : parts_)
       if (f && f->maps(p, n)) return true;
+    return false;
+  }
+
+  // (the file and the byte offset in it of mapped bytes [p, p + n), this file's or a part's: S4's read again, without
+  //  the mapping, after a page could not be read)
+  bool locate(const void* p, size_t n, std::string& file, uint64_t& off) const {
+    const uint8_t* q = (const uint8_t*)p;
+    if (base_ && q >= base_ && n <= size_ && (uint64_t)(q - base_) <= size_ - n) {
+      file = path;
+      off = (uint64_t)(q - base_);
+      return true;
+    }
+    for (const auto& f : parts_)
+      if (f && f->locate(p, n, file, off)) return true;
     return false;
   }
 

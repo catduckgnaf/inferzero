@@ -1,6 +1,6 @@
 # Tuning on Arc B-series GPUs (Xe2: B580, Pro B60, Pro B70), the B390, the Arc 140T and Alchemist
 
-The defaults per kind of GPU (2026-11-18, from the code: `zero/xe2/engine_xe2.h`, `engine_xw.h`, `zero/engine_h8.h`,
+The defaults per kind of GPU (2026-11-18, the B60's die 2026-11-21, from the code: `zero/xe2/engine_xe2.h`, `engine_xw.h`, `zero/engine_h8.h`,
 `engine_load.h`, `engine_sessions.h`). "Qwen dense" is Qwen3.5 / 3.6 / 3.8 without experts; MoE models, Gemma 4,
 Flash Next and Qwen3 keep the plain XMX or DP4a GEMM. An iGPU takes its XMX defaults only where XMX passed its
 start-time checks, the speed check included; one that failed runs as a GPU without XMX.
@@ -10,11 +10,17 @@ start-time checks, the speed check included; one that failed runs as a GPU witho
 | XMX for the prompt GEMMs | on (checked bit for bit at start) | on if the speed check finds it faster | only in the 140T preset (`ARC_XMX_FORCE=1`: `gemm_x8`) | the 140T preset; other models `gemm_x8` if the speed check finds it faster | none |
 | `ARC_140T` (the preset) | – | – | on: Qwen dense, weights decoded just in time | on: Qwen dense; since 2026-11-18 also where the decoded weights would fit (unless `--budget` is given) | – |
 | `ARC_H8` | on: Qwen dense, 4 column groups | on: Qwen dense, 1 column group | in the preset (chunks of 512+ tokens) | in the preset | off |
-| `ARC_GEMM_XW` | on with H8 (`gemm_xw` 32 x 64) | on with H8 (`gemm_xw` 32 x 64) | in the preset (`gemm_xw8` 32 x 16) | in the preset (`gemm_xw8` 32 x 16) | – |
-| `ARC_GEMM_XW_WGX` / `_LOCK` | 4 / off | 1 / off | 2 / off | 2 / off | – |
+| `ARC_GEMM_XW` | on with H8 (`gemm_xw` 32 x 64; the B60's die, B60 / B580 / B50, 64 x 32 since 2026-11-21) | on with H8 (`gemm_xw` 32 x 64) | in the preset (`gemm_xw8` 32 x 16) | in the preset (`gemm_xw8` 32 x 16) | – |
+| `ARC_GEMM_XW_WGX` / `_LOCK` | 4 / off (the B60's die: 8 / off) | 1 / off | 2 / off | 2 / off | – |
 | `ARC_GEMM_XW_2D` | 1 (a failed check: the plain form) | 0 (opt-in) | – (16 lanes only) | – | – |
-| `ARC_GEMM_XW_PF` / `_PFD` | 3 / 2 with the 2D form, 1 / 1 without | 1 / 1 | 1 / 1 | 1 / 1 | – |
+| `ARC_GEMM_XW_PF` / `_PFD` | 3 / 2 with the 2D form (the B60's die: 3 / 1), 1 / 1 without | 1 / 1 | 1 / 1 | 1 / 1 | – |
+| `ARC_XCPU` (the CPU computes MoE experts missing from the GPU cache, 2026-11-20; on any discrete 16-lane GPU, a Data Center Max too; since 2026-11-21 the same results run to run from the same cache state (the model's `.lru` file; a B60's three runs byte-identical, skipzx-lab #57); before, they moved with the copies' timing) | 1 (a B60 on PCIe 3.0 x8: Flash Next +17 %) | 0 (no gain: the iGPU reads RAM directly) | 0 | 0 (an A770 on x16: no gain) | 0 |
+| `ARC_GEMM_XW_GU` (gate + up in one launch, 2026-11-20) | 1 (a B60: +3.3 / +3.8 % at 4K / 16K, the same logits) | 0 (opt-in) | – (16 lanes only) | – | – |
 | `ARC_GEMM_XW_PACK` | – | – | 3 | 3 | – |
+| `ARC_GEMM_XW_NC_E` (the n_embd-wide H8 GEMMs at 32 x 32, 2026-11-20; `=2` turns the per-shape tiles off) | – | – | 0 (opt-in) | 0 (opt-in) | – |
+| `ARC_GEMM_XW_DB` (the 32-token tiles' reads one step ahead, 2026-11-21; `=2`: every tile, the next weights in place and the loop unrolled by 4, opt-in) | – | – | 0 (opt-in) | 1 (32 x 16 GEMMs: -4 to -10 % each) | – |
+| `ARC_GEMM_XW_BIG` / `_EPI2` (32 x 32 through local memory where it fits / the epilogue a row at a time, 2026-11-21) | – | – | 0 (until measured) | 1 / 1 (the 27B 4K +15.7 %) | – |
+| `ARC_GEMM_XW_SHAPE` (a tile per GEMM shape, 2026-11-20; one GPU only, not on a split model) | – | – | 0 (until measured) | 1: 16 x 32 where N <= n_embd and K <= 8,192, else 32 x 16 WGX 4 | – |
 | `ARC_H8_NORM` | on | off | on | on | off |
 | `ARC_H8_GRF` | 128 | 256 | 256 (128 ignored: spills) | 256 (128 ignored) | 256 |
 | `ARC_GEMM_SPLIT` (H8 GEMMs) | 34 | 17 | 17 | 17 (since 2026-11-18) | 17 |
@@ -23,7 +29,7 @@ start-time checks, the speed check included; one that failed runs as a GPU witho
 | `ARC_ATTN_XMX` / `ARC_ATTN_FX` | on / on | on / on | off / off | off / off | off / off |
 | `ARC_MOE_GEMM_PAD` (Flash Next) | on | off | off | off | off |
 | `ARC_GEMV_DB` / `ARC_GEMV_PF` | DB for dense models, PF for MoE models | off / off | off / off | off / off | off / off |
-| `ARC_GEMV_WAVE` / `_MT` | on / on | off | off | off | off |
+| `ARC_GEMV_WAVE` / `_MT` | on / on (the B60's die: off / on since 2026-11-21) | off | off | off | off |
 | `ARC_GDN_L1PF` | 2 | 0 | 0 | 2 | 0 |
 | `ARC_XALL` (MoE) | on | off | off | on | off |
 | `ARC_BATCH` | off | off | off | 64 on Windows | off |
@@ -32,6 +38,14 @@ start-time checks, the speed check included; one that failed runs as a GPU witho
 | `ARC_HOST_CPU` | on (since 2026-11-19) | – | – | on | – |
 | `ARC_GEMM_2D` / `_PF` | on where the driver offers them | the same | the same | the same | – |
 | MTP drafts a step (the 27B, not a switch) | 3 | 7 | 7 | 7 | 7 |
+
+## Data Center GPU Max (Xe-HPC) defaults (2026-11-21)
+
+A Data Center GPU Max (Ponte Vecchio, device IDs 0x0BD0-0x0BDB) takes the B-series column above, with these
+differences, from hibagus's one-stack Max 1550 sweeps (issue #48): `ARC_GVROWS` 1, `ARC_H8_NORM` 0, `ARC_H8_REUSE` 0,
+`ARC_GEMM_XW_PF` 2 (PFD 1), `ARC_GEMM_XW_WGX` 8, `ARC_MOE_GR_GU` 4, `ARC_MOE_GR_DN` 8, `ARC_MOE_GRF` 256, `ARC_MOE_CG` 4.
+Measured slower there, so not to use: `ARC_GEMV_PF=0 / 1` (-9.4 / -5.6 %), `ARC_GEMV_GRF=256` (-8.6 %),
+`ARC_IQ3S_TILE=1` (-5.0 %), `ARC_GDN_CHUNK=1 / 2` (-9 / -15 %), prompt chunks below 4,096.
 
 All the switches (environment variables; each is read once per process):
 
@@ -93,6 +107,7 @@ All the switches (environment variables; each is read once per process):
 | `ARC_GDN_PF=2` | off | `gdn_recur` holds 2 tokens' operands in registers. A B70: 293 -> 305 ms, slower; spills at 4 (16 lanes) and at 2 on 8-lane iGPUs. Bit-identical. While it is on (2 or more), `ARC_GDN_L1PF` does nothing: the PF loop has no L1 prefetch | — |
 | `ARC_GEMM_SPLIT=N` | H8 GEMMs: 34 on the B-series, 17 on iGPUs and in the Arc 140T preset (Alchemist since 2026-11-18: an A770's 27B 4K prompt 1,150 -> 1,223 tok/s, KL 0.0011 against 34, issue #36); the W8 / f16 GEMMs 17 | superblocks per split-K piece of a matrix with K > 8,192 (the 27B's FFN down: 2 pieces at 34, 4 at 17, 1 at 0). A B70's 27B 4K prompt: 34 +3.1-3.2 % (`gemm_down` 253 -> 214 ms), 0 +2 %; KL against the plain path 0.00145 / 0.00152 / 0.00155, max 0.039 / 0.052 / 0.090 (17 / 34 / 0; issue #27, 2026-11-15). Not bit-identical | — |
 | `ARC_ATTN_FX=0` / `1` / `2` | on on discrete cards (16-lane XMX) since 2026-11-15 and on 16-lane iGPUs where XMX passed its checks since 2026-11-17 (a B390's 27B 4K prompt attention 377 -> 160 ms, issue #1); off on the 140T, Alchemist and the 125H | `attn_fx` (PR #29): the plain causal prompt attention as flash attention on XMX, 8 query tokens a sub-group so every int8 DPAS has 8 rows, 32-key spans read from the int8 cache with an L1 prefetch, 32 sub-groups a work-group. Sliding windows, images, Flash Next's sparse masks and Gemma keep `attn_q8`. A Pro B70's 27B: attention 2.6-2.8x faster, prompt +4 % at 4K, +17 % at 16K, +51 % at 64K; KL 0.00152 -> 0.00146. Checked at start against `attn_q8` (else `attn_q8`). `0` `attn_q8`, `1` forced, `2` without the check (timing tests only); `ARC_ATTN_FX_WG=NT,NH`, `ARC_ATTN_FX_PF=0`, `ARC_ATTN_FX_DEFS` for tests | 9 |
+| `ARC_ATTN_X8=1` / `2` | off (opt-in since 2026-11-20 until owners measure it) | `attn_x8` (`zero/kernels/attn_x8.cl`, QUEUE A6 / T4): `attn_fx` for 8-lane XMX (the A770 / A750, the Arc 140T), whose prompts otherwise run `attn_q8` on DP4a. The scores computed transposed (keys as the DPAS rows, a token a lane: K read in full cache lines, the softmax in-lane), P turned to the A layout by one 8 x 8 transpose a span; heads of more than 128 dims over two sub-groups that add their integer partial scores through SLM. The same start-up check against `attn_q8`. `=2`: the DPAS emulated by DP4a on any GPU with 8-lane sub-groups (tests: the 125H). `ARC_ATTN_X8_WG=NT,NH` (default: all q heads of a KV head, 16 sub-groups); `ARC_ATTN_FX=0` turns it off too; `ARC_ATTN_FX_DEFS=-DX8_QH` holds q in registers (spills on dg2) | 9 |
 | `ARC_ATTN_XMX=0` | on on discrete cards with 16-lane XMX since 2026-11-10 (B60, 64K prompts: 4B +11.7 %, 9B +8.4 %, 27B +2.1 %, 35B +10.2 %) and on 16-lane iGPUs where XMX passed its checks since 2026-11-16 (a B390 at 65K: 4B 950 -> 1,079, 35B 795 -> 904 tok/s, issue #31); off on 8-lane GPUs and the 125H; `=1` forces it | the prompt attention's integer dot products (`attn_q8`) as int8 DPAS, bit-identical, checked at start bit for bit (QUEUE F33.2, 2026-11-09; 16-lane DPAS, Qwen); `ARC_ATTN_XEMU=1`: emulated (tests) | 9 |
 | `ARC_GEMV_SMALL_WG=1` | off (on on discrete cards 2026-11-10 to 11-12: a B60's 27B no gain, 23.71 without against 23.72 tok/s, gemm_ab 13.35 -> 12.72 ms; its 35B 80.35 without against 55.85 tok/s, package 18acafc); `=1` forces it | the single-token GEMV of a matrix with at most 512 sub-groups (DeltaNet's alpha / beta, 96 rows; MoE routers) in work-groups of 4 sub-groups instead of 16, spread over more Xe cores; bit-identical |10 |
 | `ARC_WIDE_ROWS=0` | on (every GPU) since 2026-11-10 | the 1-8 token row kernels that quantize for the next GEMV (`swiglu_quant` on the Qwen and MoE paths, `rmsnorm_quant`, `gated_norm_quant`, `attn_gate_quant`) in one work-group per row, as before; by default their superblocks spread over many work-groups; bit-identical |10 |
@@ -102,7 +117,7 @@ All the switches (environment variables; each is read once per process):
 | `ARC_LAUNCH_STATS=1` | off | kernel launches and host time per token | 5 |
 | `ARC_TP_*` | | the multi-GPU sums and split (`ARC_TP_SUM`, `ARC_TP_RS_MIN`, `ARC_TP_P2P`, `ARC_TP_PIPE`, `ARC_TP_EVSUM` (opt-in since 2026-11-18), `ARC_TP_OVERLAP`, `ARC_TP_LM`, `ARC_TP_RG_GU`, `ARC_TP_TIMEOUT`, `ARC_TP_ATT_QSPLIT`, `ARC_TP_SIM`) | [multi-gpu.md](multi-gpu.md) |
 
-The tools: `bench\gemm_sweep.ps1` (prompt), `bench\decode_try.ps1` (generation), `bin\mgpu_probe.exe` and
+The tools: `bench\gpu_sweep.ps1` / `.sh` (every prompt, generation, tile and drafting setting one at a time, the best combination, per-kernel profiles), `bin\mgpu_probe.exe` and
 `bin\event_probe.exe` (several GPUs), `bin\replay_probe.exe` (kernel launches), `bin\membw_probe.exe` (memory read
 bandwidth of the CPU, the GPU and both; docs/speed-progress.md), `bin\clinfo.exe` (what the driver
 offers), `bin\gpu_bench.exe` (the matrix engines' int8 / f16 / bf16, the vector engines and memory measured against
@@ -156,10 +171,65 @@ Measured by manoreken2 (issue #4), the newest release that ran each:
 One Pro B70 (friskens, issue #12, 2026-11-13; the release not stated, 2026.11.13.06 asked for), the same 27B: 4K
 prompt 2,107 tok/s, 512 tokens 1,112, generation 32.2 tok/s, 74.9-75.2 with MTP.
 
-## 1. Prompt: `bench\gemm_sweep.ps1`
+## 0. How to sweep a GPU (2026-11-21): `bench\gpu_sweep.ps1`, phase X with `xw_peak --all`
+
+One command measures every switch on any Intel GPU. It can be stopped and run again: it goes on where it stopped.
 
 ```powershell
-.\bench\gemm_sweep.ps1 -Models C:\hf\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -Tokens 4096
+.\bench\gpu_sweep.ps1 -Model C:\hf\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+```
+
+- **Phases** `GPXDTKM` (all by default; `-Phases` picks some): G generation, P the prompt, each with H (logits
+  against the defaults) and C (the best combination); X the 8-lane XMX GEMM, below; D drafting; T the XMX tile per
+  GEMM; K where the time goes; M a MoE model's switches (`-MoeModel`).
+- **Contexts** (`-Contexts`, default `512,4096,32768,max`): the prompt lengths that C and X measure, short, medium,
+  long and the longest that runs (262144, else 131072, else 65536). Prompts over 4K run once. `-Contexts 512,4096`
+  is the short version (and `-Quick`'s default).
+- **Going on after a stop**: each finished run is saved in `%USERPROFILE%\.inferzero\gpu-sweep` (one folder per
+  model, device and build of runz) and comes back as it was when the sweep runs again. The folder is removed when the
+  sweep ends; `-Fresh` starts again.
+- **Warm-ups**: every new set of switches first runs a 512-token prompt that is not timed (new kernels build
+  there). Inside xw_peak, every timing follows an untimed launch.
+- **Other programs**: the sweep waits up to 30 minutes for any runz / serverz / xw_peak already running.
+
+**Phase X** (A-series and the Arc 140T: 8-lane XMX; other GPUs skip it):
+
+1. `bin\xw_peak.exe --all` builds every form of the prompt GEMM `gemm_xw8` with both operands packed, about 600:
+   - without local memory: TM 16 / 32 / 64 x NC 1 / 2 / 4 x WGX 1 / 2 / 4 x DB 0 / 1 / 2 x EPI2 0 / 1;
+   - with local memory: TM x NC x 2 / 4 / 8 sub-groups each way x 1 / 2 / 4 chunks a stage x EPI2, where it fits
+     in 64 KB.
+2. Stage 0 drops the forms that spill registers or do not build. Stage 1 times every survivor quickly on the 27B's
+   GEMM shapes (gate, up + SwiGLU, down, qkv, z, ssm_out) at each chunk size of the contexts (512 and 4096).
+3. Stage 2 times the best 10 again and checks each one bit for bit against the plain kernel. Stage 3 tries the best 3
+   with `ARC_GEMM_RG` 1 / 2 / 8 and, without local memory, the prefetch.
+4. Each winner is written as the engine's switches, for example `ARC_GEMM_XW_BIG=1 ARC_GEMM_XW_SLM_TILE=32x64
+   ARC_GEMM_XW_SLM_WG=2,4 ARC_GEMM_XW_SLM_CPS=1 ARC_GEMM_RG=4`.
+5. The model then runs with each winner at every context, the defaults first and last (drift). Each winner's logits
+   are compared with the defaults'. The last lines give the best per context, with the same logits.
+
+`-XwArgs "..."` passes more options to xw_peak (`bin\xw_peak.exe --help`): `--family slm` (only local memory), `--tm
+32`, `--top 20`, or `--limit 40` for a quick look. xw_peak alone:
+
+```powershell
+.\bin\xw_peak.exe --all --ms 512,4096 --env-out winners.txt
+```
+
+**The engine's switches for the forms** (all opt-in, unset nothing changes):
+
+- `ARC_GEMM_XW_SLM_TILE=TMxCOLS` takes any of 16 / 32 / 64 each.
+- A shape that needs more than 64 KB of local memory is refused with a log line, and the default tile is used.
+- `ARC_GEMM_XW_DB=1` turns the double buffer on for every tile, as xw_peak measures it (before: only 32-token tiles).
+
+Checked on the laptop with the A770 preset emulated: 16x32 4x4, 32x64 2x4, 16x16 4x4 with 2 chunks a stage and the
+default, each byte-identical to the default logits (1,024 tokens).
+
+**Time** (estimates, not measured on a card yet): xw_peak --all is mostly its ~600 kernel builds, likely under an
+hour the first time. Phase X in the model adds ~1-2 hours with 32K and the max context.
+
+## 1. Prompt: `bench\gpu_sweep.ps1 -Phases PTK`
+
+```powershell
+.\bench\gpu_sweep.ps1 -Model C:\hf\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -Phases PTK
 ```
 
 One setting at a time from the defaults, then the best of each together. New since 2026-11-01:
@@ -178,10 +248,10 @@ scales) its KL against the default was 0.009 / 0.00001 / 0.026 / 0.0055 at four 
 changed at the 4th token: probably over the limit against f32, so it stays a switch. A dense 27B quantizes more
 matrices this way.
 
-## 2. Generation: `bench\decode_try.ps1`
+## 2. Generation: `bench\gpu_sweep.ps1 -Phases GDK`
 
 ```powershell
-.\bench\decode_try.ps1 -Models C:\hf\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -DFlash <the 27B's DFlash2 drafter folder>
+.\bench\gpu_sweep.ps1 -Model C:\hf\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -Phases GDK -DFlash <the 27B's DFlash2 drafter folder>
 ```
 
 The same greedy answer (256 tokens of Python) plain, with `--mtp`, `--mtp --mtp-drafts 7`, with the DFlash2
@@ -320,7 +390,7 @@ accumulator still adds its 16-blocks in the same order, so CG 1 / 2 / 4 give the
 with DPAS emulated, 27B).
 
 ```powershell
-.\bench\gemm_sweep.ps1 -Models C:\hf\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf   # rows X16, X16TM, X16GRF, X16CG
+.\bench\gpu_sweep.ps1 -Model C:\hf\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -Phases P   # the ARC_X16 rows
 $env:ARC_X16=1; .\bin\runz.exe C:\hf\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --bench-pp 4096 --n 64; Remove-Item Env:ARC_X16
 ```
 
@@ -877,7 +947,7 @@ spill; 64 x 16 spills plainly but not with `XW_PACKA` + `XW_PACKW` (`bin\xw_peak
 64 x 32 spill. `xw_sweep.ps1 -Wide` adds 16 x 64, 64 x 16 and 32 x 64 to its 140T rows. `xw_peak` lists them all with
 the packed forms (one minute: `bin\xw_peak.exe`).
 
-**To measure (a B60):** `.\bench\xw_sweep.ps1 -Model <27B gguf>`: the prompt at 512 / 4K / 16K tokens for the
+**To measure (a B60):** `.\bench\gpu_sweep.ps1 -Model <27B gguf> -Phases PT`: the prompt at 512 / 4K / 16K tokens for the
 default and four tile shapes, each shape's logits against the default's (identical expected), and a `--prof` of the
 default and the fastest shape at 4K. Left after that: the weights double-buffered in registers, the W8 and MoE
 expert layouts, and an 8-lane form for the Arc 140T.
@@ -1046,3 +1116,79 @@ aborted at start-up (command_stream_receiver.cpp line 1205), so the 2D-store che
 `ARC_IQ3S_TILE=1` (v2, the loads ahead) on the same B65: 22.05 / 21.97 -> 20.65 / 20.72 tok/s, the same logits; the three
 GEMVs 5-8 % slower each. With the B70's 35.24 -> 32.7 (v1), the planar layout loses on both discrete cards measured:
 it stays an off-by-default test switch, and the B65's generation gap is not the codebook decode.
+
+## 16. The kernel loops in the compiler's output (the L-audit's L2, 2026-11-21)
+
+The full sweeps found every switch already at its best (the user: "the hidden costs must be in the kernel loop
+then"). So the heaviest kernels were compiled offline for each GPU (`tools\kernel_isa.ps1 -Device ... -Loops`, ocloc 2026.1)
+and the instructions of their inner loop counted. This needs no GPU. A loop is a branch back to an earlier label; its
+body's counts follow. One `dpas.8x8` keeps the systolic array busy about 8 cycles. A thread issues one instruction at
+a time, so when a loop has many more instructions than that per DPAS, issuing them is the limit, not the XMX.
+
+| Kernel, GPU (build options as the engine's defaults) | Loop: instructions | DPAS / DP4a | Memory messages | Per DPAS |
+|---|---|---|---|---|
+| gemm_xw8, A770 (dg2-g10): the big tile, 32 x 32 through local memory, 4 x 4 sub-groups, EPI2 | 410 | 33 DPAS | 46 (37 local) | 12.4 |
+| gemm_xw, B390 (ptl-h): 32 x 64, plain loads (the iGPU default) | 1,323 | 128 DPAS | 320 | 10.3 |
+| gemm_xw, B390 (ptl-h): 32 x 64, 2D block loads (`ARC_GEMM_XW_2D=1`; the discrete default) | 317 | 128 DPAS | 20 | 2.5 |
+| gemv, IQ3_S tiled, A770 (dg2-g10), 1 row a sub-group | 224 | 8 DP4a | 15 | - |
+| gemv, the same, 2 rows (`ARC_GVROWS=2`) | 406 | 16 DP4a | 27 | - |
+| gdn_recur, A770 (dg2-g10) | 676 | - | 12 | - |
+
+What it shows:
+- **The A770's GEMM is bound by issuing its own loop.** 12.4 instructions a DPAS against ~8 cycles of XMX work caps
+  it near 8 / 12.4 = 65 % of peak. That is what hansong80's `xw_peak --probe` measured with the data in cache
+  (~65 %, issue #45). The 64 % of the prompt the GEMMs take, at 48 % of peak, is this ceiling plus memory stalls.
+  - What fills the loop besides the 33 DPAS: 158 integer instructions, 79 moves, 57 syncs and 36 branches. Each
+    global load recomputes its 64-bit address from the K index, about 20 scalar instructions (an `addc` carry chain
+    through the accumulator, `shl` / `shr` / `or` to split it). The cooperative fills of local memory sit in SIMD
+    branches (`goto` / `join`), one per piece.
+  - The next form to build (opt-in, bit-identical: the same bytes in the same DPAS operands): pointers that advance
+    by a constant each K step, with 32-bit offsets from a base set once before the loop; and the local-memory fill
+    without branches. The target is the B-series' 2.5 a DPAS; at ~6 the ceiling would pass 100 %.
+  - Built the same day as `ARC_GEMM_XW_PTR=1` (gemm_xw8 `-DXW_PTR`, opt-in): **410 -> 184 instructions, 5.6 a DPAS**,
+    9 moves instead of 79, 6 branches instead of 36, no spill; with 2 chunks a stage 989 -> 458. Bit for bit in
+    xw_peak and the 27B's logits. Its speed on an A770: asked on #45 (xw_peak's "slm 32x32 4x4 e2" against "... e2 p").
+- **The B390 runs the plain form, four times the 2D form's instructions.** The 2D block loads are on by default only
+  on discrete cards; on iGPUs they were never measured. Asked on #1 and #74 (`ARC_GEMM_XW_2D=1`, checked bit for bit
+  at start).
+- **gdn_recur's L1 prefetch is not in the A770's build.** `-DGDN_L1PF=2` (the discrete default) gives the same code
+  as without it on dg2-g10, since the kernel's guard needs `cl_intel_subgroup_buffer_prefetch`. ocloc may define
+  fewer extensions than the driver does, so the card's own list decides it (`clinfo --all`). If the A770's driver
+  lacks it too, the prefetch has never run there and the B-series' DeltaNet gain cannot come to it this way.
+- The IQ3_S GEMV spends 131 of 224 instructions a superblock on integer work decoding the codebook, against 8 DP4a.
+  Two rows a sub-group nearly double the loop (406), which is why `ARC_GVROWS=2` gains little.
+
+(The counts come from ocloc's own compiler, which can differ slightly from the one in a user's driver. The B60's
+gdn_recur did not build for bmg-g21 offline: "backend compiler failed build", to look at.)
+
+## 17. H8 in two passes for exact work (`ARC_H8_Q2=1`, 2026-11-21)
+
+H8's int8 rounding of the rotated activations doubles the KL against f32 on every GPU where it runs (the laptop's 27B,
+480 tokens: 0.00056 plain, 0.00112 H8). `ARC_H8_Q2=1` quantizes what that rounding left out into a second int8 plane
+with its own per-token scale, and runs each H8 GEMM a second time on it, adding the result. KL 0.00061, top token
+474 / 480, the plain path's level. For exact work only: about twice the H8 GEMMs' time (the laptop's 4K prompt
+115-120 -> 62.5 tok/s, where the GEMMs are DP4a and most of the prompt), and a second activation buffer. Step 2, one
+kernel reading both planes against the same weights, waits on its speed on XMX cards (the 140V, the B390).
+
+## 18. The B60's die: its own prompt tile and GEMV rule (2026-11-21, skipzx-lab #57, MaineTim #19)
+
+Two Pro B60s ran the full sweep on the 27B IQ3_S. The B70's defaults were not the B60's best. The B60's die,
+BMG-G21, also makes the B580 and the B50; the engine tells it apart by its PCI device ID, 0xE200-0xE21F (`xe2_g21`,
+`zero/xe2/engine_xe2.h`; `zrt::bmg_g21`). Not by its core count: a Pro B65 has the B60's 160 EUs on the B70's die
+(BMG-G31, 0xE222), and keeps the B70's defaults until it is measured.
+
+- **The prompt GEMM, 64 x 32 tiles, 8 column sub-groups a work-group, the 2D prefetch 1 chunk ahead:** phase X
+  (skipzx-lab, Linux, ec99a4a) timed 336 forms of `gemm_xw` alone, then the best six in the model. This one was
+  the fastest at every context: 512 / 4K / 32K tokens 1,109.9 / 1,872.5 / 1,619.3 -> 1,171.8 / 1,954.2 / 1,680.0
+  tok/s (+5.6 / +4.4 / +3.7 %), the logits the same at each, the two default runs 0.0 % apart. As every form, it is
+  checked bit for bit at start; where C's 2D form differs on a driver, the start check rounds the product first
+  or takes the plain form, as before.
+- **Generation, the one-token GEMVs' rows by type again:** `ARC_GEMV_WAVE` picks rows from the thread count, which
+  took a B70 from 32.3 to 35.2 tok/s. On a B60 it costs: `ARC_GEMV_WAVE=0` was +3.5 % (skipzx-lab, 23.29 -> 24.10
+  tok/s) and +2.4 % (MaineTim, Windows, 23.36 -> 23.91), the logits the same. Its 2-8-token part, for MTP
+  verification, stays on: it was not measured apart.
+- **Not changed:** 4 drafts instead of 3 (+2.4 % on one B60, +0.5 % on the other), `ARC_GVROWS=4` (+2.7 %, below
+  `WAVE=0`).
+
+Each switch set by hand still wins: `ARC_GEMM_XW_TM=32 ARC_GEMM_XW_NC=4 ARC_GEMM_XW_WGX=4 ARC_GEMM_XW_PF=3
+ARC_GEMM_XW_PFD=2 ARC_GEMV_WAVE=1` is the B70's form on a B60.

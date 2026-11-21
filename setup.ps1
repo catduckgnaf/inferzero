@@ -105,7 +105,7 @@ if (-not ($gpus | Where-Object { $_.Name -match "Arc" })) { Note "only Intel Arc
 # Visual Studio C++ compiler (the same search as build.ps1): not for a ready-to-use package
 . (Join-Path $PSScriptRoot "scripts\vcvars.ps1")
 $vcvars = if ($prebuilt) { "" } else { Find-VcVars }
-if ($prebuilt) { Ok "C++ compiler: not needed (ready-to-use package: $((Get-Content $prebuiltFile -TotalCount 1).Trim()))" }
+if ($prebuilt) { Ok "C++ compiler: not needed (ready-to-use package: $((Get-Content -Encoding UTF8 $prebuiltFile -TotalCount 1).Trim()))" }
 elseif ($null -eq $vcvars) {
   Bad "No Visual Studio C++ compiler found." ("Install 'Build Tools for Visual Studio' (https://visualstudio.microsoft.com/downloads/, " +
     "under 'Tools for Visual Studio') with the workload 'Desktop development with C++', then run setup again.")
@@ -130,7 +130,7 @@ function Build([string[]]$srcs) {
   $ErrorActionPreference = "Continue"
   & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "build.ps1") @srcs *> $buildLog
   if ($LASTEXITCODE -ne 0) {
-    Get-Content $buildLog | Where-Object { $_ -match "error|failed" } | Select-Object -First 15 | ForEach-Object { Write-Host "        $_" }
+    Get-Content -Encoding UTF8 $buildLog | Where-Object { $_ -match "error|failed" } | Select-Object -First 15 | ForEach-Object { Write-Host "        $_" }
     Bad "build failed" "full compiler output: $buildLog"
   }
   Ok "built $($srcs -join ', ')"
@@ -139,7 +139,7 @@ $newestHeader = (Get-ChildItem (Join-Path $root "src") -Filter *.h | Measure-Obj
 # (inferzero: zero\serverz.cpp is tools\server.cpp on zero\engine.h, so it depends on both and on zero\*.h)
 $newestZero = (Get-ChildItem (Join-Path $root "zero") -Filter *.h | Measure-Object LastWriteTime -Maximum).Maximum
 $need = @()
-if ($prebuilt) { Ok "ready-to-use package: the exes as shipped ($((Get-Content $prebuiltFile -TotalCount 1).Trim()); setup -Rebuild builds them)" }
+if ($prebuilt) { Ok "ready-to-use package: the exes as shipped ($((Get-Content -Encoding UTF8 $prebuiltFile -TotalCount 1).Trim()); setup -Rebuild builds them)" }
 foreach ($t in $(if ($prebuilt) { @() } else { "tools\clinfo", "zero\serverz", "zero\runz", "zero\transcribez", "tools\zero_recorder" })) {
   $name = Split-Path $t -Leaf
   $exe = Join-Path $bin "$name.exe"

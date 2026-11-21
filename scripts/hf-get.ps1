@@ -24,7 +24,7 @@ function Get-Sha256([string]$path) {
 function Get-HfToken {
   if ($env:HF_TOKEN) { return $env:HF_TOKEN }
   $f = Join-Path $env:USERPROFILE ".cache\huggingface\token"
-  if (Test-Path $f) { return (Get-Content $f -Raw).Trim() }
+  if (Test-Path $f) { return (Get-Content -Encoding UTF8 $f -Raw).Trim() }
   return ""
 }
 # A repository file's path inside the snapshot folder, or an error: a name from a pasted link or a repository's own
@@ -108,21 +108,49 @@ function Get-HfFiles([string]$Repo, [string[]]$Files, [string]$Hub = (Get-HfHub)
     $size = [int64]$e.size
     if ((Test-Path $dst) -and (Get-Item $dst).Length -eq $size) { Write-Host "    $f is there"; continue }
     $part = "$dst.part"
-    $have = if (Test-Path $part) { (Get-Item $part).Length } else { 0 }
-    if ($have -gt $size) { Remove-Item $part; $have = 0 }
-    if ($have -lt $size) {
-      Write-Host ("    {0} ({1:N2} GB{2})" -f $f, ($size / 1e9), $(if ($have) { ", resuming at {0:N2} GB" -f ($have / 1e9) } else { "" }))
-      # (--speed-time: a connection that stalls, under 1 byte/s for 2 minutes, ends with an error instead of waiting
-      #  forever, so the launcher's Downloads dialog tries again)
-      $a = @("-L", "--fail", "--retry", "5", "--retry-delay", "3", "--speed-limit", "1", "--speed-time", "120", "--progress-bar", "-o", $part)
-      if ($have) { $a += @("-C", "-") }
-      # (a speed limit: $env:ARC_HF_RATE in curl's form, e.g. 5M = 5 MiB/s; the launcher's Downloads dialog sets it)
-      if ($env:ARC_HF_RATE -match '^\d+[KkMmGg]?$') { $a += @("--limit-rate", $env:ARC_HF_RATE) }
-      if ($token) { $a += @("-H", "Authorization: Bearer $token") }
-      & $curl @a "https://huggingface.co/$Repo/resolve/$sha/$f"
-      if ($LASTEXITCODE -ne 0) { throw "downloading $f failed (curl exit $LASTEXITCODE): run this again, it goes on where it stopped" }
+    # (one download of a file at a time: a second one writing the same .part (two windows, the launcher and a script)
+    #  appended its bytes to the first's, a 16.67 GB file grew to 17.8 GB and was downloaded again from nothing,
+    #  2026-11-21. The lock is a file held open without sharing while this file downloads; Windows lets it go when
+    #  the process ends, however it ends)
+    $lock = $null
+    try {
+      $lock = [IO.File]::Open("$part.lock", [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch [IO.IOException] {
+      throw "$f is being downloaded by another window or program now: let that one finish (or close it), then run this again"
     }
-    if ((Get-Item $part).Length -ne $size) { throw "$f is $((Get-Item $part).Length) bytes, the repository says ${size}: run this again" }
+    try {
+      $have = if (Test-Path $part) { (Get-Item $part).Length } else { 0 }
+      if ($have -gt $size) { Remove-Item $part; $have = 0 }
+      if ($have -lt $size) {
+        Write-Host ("    {0} ({1:N2} GB{2})" -f $f, ($size / 1e9), $(if ($have) { ", resuming at {0:N2} GB" -f ($have / 1e9) } else { "" }))
+        # (the tries made here, not by curl's --retry: with -C - curl's own retry resumed from the offset it found at
+        #  its start, so the bytes between it and a cut were written twice. Each try resumes from the .part's length
+        #  measured just before it. --speed-time: a connection that stalls, under 1 byte/s for 2 minutes, ends with
+        #  an error instead of waiting forever, so the next try (or the launcher's Downloads dialog) goes on)
+        $code = 0
+        for ($try = 1; $try -le 6; ++$try) {
+          $have = if (Test-Path $part) { (Get-Item $part).Length } else { 0 }
+          if ($have -ge $size) { break }
+          $a = @("-L", "--fail", "--speed-limit", "1", "--speed-time", "120", "--progress-bar", "-o", $part)
+          if ($have) { $a += @("-C", "$have") }
+          # (a speed limit: $env:ARC_HF_RATE in curl's form, e.g. 5M = 5 MiB/s; the launcher's Downloads dialog sets it)
+          if ($env:ARC_HF_RATE -match '^\d+[KkMmGg]?$') { $a += @("--limit-rate", $env:ARC_HF_RATE) }
+          if ($token) { $a += @("-H", "Authorization: Bearer $token") }
+          & $curl @a "https://huggingface.co/$Repo/resolve/$sha/$f"
+          $code = $LASTEXITCODE
+          if ($code -eq 0) { break }
+          # (22: --fail's HTTP error, such as a 401 / 404: trying again does not help)
+          if ($code -eq 22 -or $try -eq 6) { break }
+          Write-Host "    the download stopped (curl exit $code): trying again in 3 s ($try of 5)"
+          Start-Sleep 3
+        }
+        if ($code -ne 0) { throw "downloading $f failed (curl exit $code): run this again, it goes on where it stopped" }
+      }
+      if ((Get-Item $part).Length -ne $size) { throw "$f is $((Get-Item $part).Length) bytes, the repository says ${size}: run this again" }
+    } finally {
+      $lock.Dispose()
+      Remove-Item "$part.lock" -ErrorAction SilentlyContinue
+    }
     if ($e.lfs -and $e.lfs.oid) {
       Write-Host "    checking $f (SHA256)..."
       $h = Get-Sha256 $part

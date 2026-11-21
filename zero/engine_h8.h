@@ -32,6 +32,19 @@
   size_t stage_hh_bytes_[kRoles] = {};
   std::map<const GpuWeight*, cl_mem> h8_res_;   // (a resident weight converted in place: its H8 scales)
 
+  // ARC_H8_Q2=1 (2026-11-21, opt-in on every GPU where H8 runs; QUEUE "H8's flips", step 1, the user: "Add opt-in
+  // pass"): H8's activations in two int8 planes, the value's code and its residual (kernels/h8.cl h8r_act -DQ2), each
+  // H8 GEMM run a second time on the residual and added (h8_matmul). H8's own rounding doubled the KL against f32 on
+  // every GPU (the laptop's 27B 0.00056 plain -> 0.00112 H8); this is for exact work, at ~2x the H8 GEMMs' time. The
+  // fused forms that cannot take two passes fall back to their separate kernels while it is on: the norm and the
+  // rotation in one (ARC_H8_NORM), the SwiGLU in the up GEMM's epilogue, gate + up in one launch. H8R only (one scale
+  // per token and column), not ARC_H8_SB. Off: every kernel and its build options as before
+  static bool h8_q2() {
+    static const bool on = getenv("ARC_H8_Q2") && atoi(getenv("ARC_H8_Q2")) != 0 && h8_row();
+    return on;
+  }
+  cl_mem h8_aq2_ = nullptr, h8_asc2_ = nullptr;  // (ARC_H8_Q2: the residual plane, as h8_aq_ / h8_asc_)
+  bool h8_q2_pass_ = false;                      // (the second pass is running: the rotation is already made)
   static bool h8_env() {
     static const bool on = getenv("ARC_H8") && atoi(getenv("ARC_H8")) != 0;
     return on;
@@ -104,6 +117,10 @@
     if (!h8_) return;
     h8_aq_ = buf(M * (size_t)maxK);
     h8_asc_ = buf(M * (size_t)(maxK / 256) * 4);
+    if (h8_q2()) {  // (the second plane: as big as the first; only with ARC_H8_Q2=1)
+      h8_aq2_ = buf(M * (size_t)maxK);
+      h8_asc2_ = buf(M * (size_t)(maxK / 256) * 4);
+    }
     if (h8_row()) return;
     for (int r = 0; r < kRoles; ++r)  // (a role's H8 scales: N * K / 256 floats, an eighth of its W8 header at most)
       if (stage_need_h_[r]) stage_hh_[r] = buf(stage_hh_bytes_[r] = stage_need_h_[r] / 8 + 64);
@@ -123,7 +140,10 @@
   // 2,772 tok/s (h8_decode 61.9 -> 43.7 ms, h8_act 95.0 -> 88.5), the same logits (joshdev-de, issue #27, release
   // 2026.11.17.03); the B60 is the same chip. Lunar / Panther Lake keep 256 until a B390 measures it. ARC_H8_GRF=256: 256
   std::string h8_grf() const {
-    static const int e = getenv("ARC_H8_GRF") ? atoi(getenv("ARC_H8_GRF")) : (zrt::integrated() ? 256 : 128);
+    // (the switch read once; the default per call, so each shard of a split over unlike GPUs decides for its own, not
+    //  the first one asking: the Researcher, 2026-11-20)
+    static const int env = getenv("ARC_H8_GRF") ? atoi(getenv("ARC_H8_GRF")) : 0;
+    const int e = env ? env : (zrt::integrated() ? 256 : 128);
     return (e == 128 && !cl_.sg8) || e == -128 ? std::string() : std::string("-cl-intel-256-GRF-per-thread ");
   }
   cl_kernel h8r_kernel(int hb, int src, const char* name, const std::string& extra = std::string()) {
@@ -202,14 +222,15 @@
   // ARC_H8_REUSE=0 rotates before each GEMM as before.
   int h8_share_ = 0, h8_last_M_ = -1, h8_last_K_ = -1, h8_last_a32_ = -1;
   cl_mem h8_last_aq_ = nullptr;  // (the input it was rotated from: a two-pass model swaps aq_)
-  static bool h8_reuse_env() {
-    static const bool on = !getenv("ARC_H8_REUSE") || atoi(getenv("ARC_H8_REUSE")) != 0;
-    return on;
+  // (a Data Center GPU Max: off by default, see xehpc_on in zero/xe2/engine_xe2.h)
+  bool h8_reuse_env() const {
+    static const char* e = getenv("ARC_H8_REUSE");
+    return e ? atoi(e) != 0 : !xehpc_on();
   }
   struct H8Share {
     Engine* e;
     explicit H8Share(Engine* en) : e(en) {
-      e->h8_share_ = h8_reuse_env() ? 1 : 0;
+      e->h8_share_ = e->h8_reuse_env() ? 1 : 0;
       e->h8_last_K_ = -1;
     }
     ~H8Share() {
@@ -226,7 +247,22 @@
   // rotation reads big_ itself and swiglu_quant is left out. Bit-identical; ARC_H8_SWI=0 as before.
   // h8_takes: matmul1's prompt path takes the H8 GEMM for w (its first branch past the GEMVs)
   bool h8_takes(const GpuWeight& w, int Mp) const {
-    return cur_T_ > 8 && !q2mm_ && h8_ok(w) && (!p140_ || h8_env() || p140_take(w, Mp));
+    return cur_T_ > 8 && !q2mm_ && h8_ok(w) && (!p140_ || h8_env() || p140_take(w, Mp)) && (w.wq || h8_igpu_rows_ok(Mp));
+  }
+  // (2026-11-19) iGPUs with 16-lane XMX (Lunar Lake's Arc 140V, Panther Lake's B390) take the default H8 from chunks
+  // of ARC_H8_MIN rows (default 256), shorter chunks the plain XMX GEMM. a1ex4's 140V (issue #60), the 27B, --bench-pp
+  // best of 3, H8 / without: 128 tokens 86 / 89-93 tok/s, 256 156 / 96, 512 252 / 176, 1K 339 / 185, 4K 384 / 170: the
+  // lines cross at ~140 tokens (a 128-token prompt spends 59 % of its time decoding weights for H8). Accuracy: KL against
+  // f32 on 480 tokens 0.00117 (max 0.029, top token 470 / 480) with H8, 0.00057 (473 / 480) without: both far inside
+  // 0.015, and generation never runs H8. (The first threshold, 1,024, came from cold one-shot runs and made 256-1,023
+  // tokens 1.4-1.8x slower: release .05.) Discrete cards and ARC_H8=1 as before; the 125H never runs H8.
+  // (Weights resident in W8 always take H8 (h8_takes): h8_prepare rotates a resident copy in place the first time, so
+  //  the plain GEMM would then read rotated weights with unrotated activations, wrong logits on a short chunk after a
+  //  long one. Self audit 2026-11-20, A1; the 140T preset's resident form keeps its copy unrotated instead, p140_res_)
+  bool h8_igpu_rows_ok(int Mp) const {
+    if (!h8_auto_ || !zrt::integrated() || h8_env()) return true;
+    static const int min_rows = getenv("ARC_H8_MIN") ? std::max(0, atoi(getenv("ARC_H8_MIN"))) : 256;
+    return Mp >= min_rows;
   }
   bool h8_swi_ok(const GpuWeight& down, int Mp) const {
     static const bool on = !getenv("ARC_H8_SWI") || atoi(getenv("ARC_H8_SWI")) != 0;
@@ -253,13 +289,13 @@
   //  7368768); the B60's no gain of 11-14 was before the 128-register default. iGPUs off; =0 off, =1 on)
   bool h8_norm_env() const {
     static const char* e = getenv("ARC_H8_NORM");
-    return e ? atoi(e) != 0 : p140_ || !zrt::integrated();
+    return e ? atoi(e) != 0 : p140_ || (!zrt::integrated() && !xehpc_on());  // (a Max: off, see xehpc_on)
   }
   // rmsnorm_quant for the input of `next` (the first GEMM of the open H8Share scope that reads it); rmsnorm_quant as
   // before where the fused form does not apply
   void rmsnorm_h8(cl_mem x, int row_off, cl_mem w, int K, int Mp, int T, int act32, const GpuWeight& next) {
     const int hb = h8_block(K);
-    if (!h8_norm_env() || !h8_share_ || !h8_row() || h8f_defs_.empty() || wide_rows(T) || !h8_takes(next, Mp) ||
+    if (!h8_norm_env() || h8_q2() || !h8_share_ || !h8_row() || h8f_defs_.empty() || wide_rows(T) || !h8_takes(next, Mp) ||
         next.K != K || K % 256 || K % hb || K / hb > 16 || (size_t)K * 4 + 64 > 60 * 1024) {  // (the row in local memory)
       rmsnorm_quant(x, row_off, w, K, Mp, T, act32);
       return;
@@ -279,6 +315,7 @@
   }
   // this GEMM's input (aq_ / asc_, per-32 scales when act32) rotated into h8_aq_ / h8_asc_
   void h8_act(int Mp, int K, bool act32) {
+    if (h8_q2_pass_) return;  // (ARC_H8_Q2's second pass: both planes were made by the first)
     // (rmsnorm_h8 left this input rotated: from the f32 values, so per-32 scales or not make no difference)
     if (h8_pre_live_ && !h8_fsrc_ && h8_row() && Mp == h8_pre_M_ && K == h8_pre_K_) return;
     h8_pre_live_ = false;
@@ -292,8 +329,10 @@
     if (h8_row()) {
       // (gemm_xw8's packed order where it will read them, ARC_GEMM_XW_PACK: engine_xw.h xw_pack_a)
       cl_kernel k = h8r_kernel(hb, 0, "h8r_act", (h8_fsrc_ ? std::string(" -DH8F=0") : h8f_defs_) +
-                                                     (xw_pack_a(Mp, K) ? " -DXW_PACKA_OUT" : ""));
+                                                     (xw_pack_a(Mp, K) ? " -DXW_PACKA_OUT" : "") +
+                                                     (h8_q2() ? " -DQ2" : ""));
       set_args(k, 0, src, asc_, a32, h8_aq_, h8_asc_, M, KK);
+      if (h8_q2()) set_args(k, 7, h8_aq2_, h8_asc2_);  // (after the 7 above: aqh2, asch2)
       const size_t wg = 16 * (size_t)(K / hb);
       size_t gws[1] = {wg * Mp}, lws[1] = {wg};
       run("h8_act", k, 1, gws, lws);
@@ -309,7 +348,7 @@
   // stays the weight, so a layer's next chunks find it converted)
   // (packed: a staged weight in gemm_xw8's packed order, ARC_GEMM_XW_PACK; resident weights stay in the plain one)
   void h8_prepare(const GpuWeight& w, cl_mem& wq, cl_mem& hh, bool packed = false) {
-    if (w.wq && h8_row()) {
+    if (w.wq && h8_row() && !p140_res_) {  // (p140_res_: the resident copy stays unrotated for the short chunks)
       if (packed) throw std::logic_error("h8_prepare: a resident weight in the packed order");
       auto it = h8_col_.find(&w);
       hh = it != h8_col_.end() ? it->second : h8r_weights(w, w.wq, w.wh);
@@ -377,8 +416,22 @@
     const int nsb = K / 256;
     return a != 2 && K > 8192 && sk_sb > 0 ? (nsb + sk_sb - 1) / sk_sb : 1;
   }
-  // the GEMM (matmul1's prompt path) in H8: the same grid, split-K and epilogues as the W8 GEMM
+  // the GEMM (matmul1's prompt path) in H8: the same grid, split-K and epilogues as the W8 GEMM. With ARC_H8_Q2 a
+  // second pass on the residual plane, added (a = 1): the planes and the scales swapped in, the same kernels, pieces
+  // and weights; the fused SwiGLU (a = 2) is not linear, so it is never asked for then (engine_qwen.h layer_ffn)
   void h8_matmul(const char* name, const GpuWeight& w, int Mp, cl_mem C, int ldc, int c_off, int a, bool act32) {
+    h8_matmul1(name, w, Mp, C, ldc, c_off, a, act32);
+    if (!h8_q2()) return;
+    if (a == 2) throw std::logic_error(std::string("gemm ") + name + ": ARC_H8_Q2 with the fused SwiGLU epilogue");
+    struct Swap {
+      Engine* e;
+      explicit Swap(Engine* en) : e(en) { flip(); e->h8_q2_pass_ = true; }
+      ~Swap() { flip(); e->h8_q2_pass_ = false; }
+      void flip() { std::swap(e->h8_aq_, e->h8_aq2_); std::swap(e->h8_asc_, e->h8_asc2_); }
+    } sw(this);
+    h8_matmul1(name, w, Mp, C, ldc, c_off, 1, act32);
+  }
+  void h8_matmul1(const char* name, const GpuWeight& w, int Mp, cl_mem C, int ldc, int c_off, int a, bool act32) {
     // (H8R: a split's whole dot product is one int32 sum, |sum| <= 127 * 127 * K: past 133,000 values per split it
     //  could overflow. The models' K is 17-22K today and split-K cuts it further; a refusal, not a wrong answer)
     if (h8_row()) {

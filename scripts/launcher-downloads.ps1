@@ -162,7 +162,7 @@ function Show-Downloads {
   }
   # the log of the current run: DONE / FAIL lines into st
   function Read-Log {
-    foreach ($l in @(Get-Content $st.out -ErrorAction SilentlyContinue)) {
+    foreach ($l in @(Get-Content -Encoding UTF8 $st.out -ErrorAction SilentlyContinue)) {
       if ($l -match '^DONE (\S+)') { $st.done[$Matches[1]] = $true }
       elseif ($l -match '^FAIL (\S+) (.*)$') { if ($st.fails -notcontains $l) { $st.fails += $l } }
     }
@@ -187,7 +187,7 @@ function Show-Downloads {
         $st.last = $now; $st.lastT = [DateTime]::Now
         $got = [math]::Max([double]0, [double]$now - $st.base)
         $bar.Value = [int][math]::Min([double]100, [math]::Max([double]0, 100 * $got / [math]::Max([double]1, [double]$st.total)))
-        $lines = @(Get-Content $st.out -ErrorAction SilentlyContinue)
+        $lines = @(Get-Content -Encoding UTF8 $st.out -ErrorAction SilentlyContinue)
         $cur = ($lines | Where-Object { $_ -like "START *" } | Select-Object -Last 1) -replace '^START ', ''
         $info.Text = "Downloading {0} ... {1:N2} of {2:N2} GB, {3:N1} MB/s" -f $cur, ($got / 1e9), ($st.total / 1e9), ($rateNow / 1MB)
         if ($st.proc.HasExited) {

@@ -251,8 +251,16 @@ __kernel void h8r_weights(__global uint* wq, __global const uint* restrict wh, _
 // with their scales asc (per 32 values with act32, [K / 32][M], else per 256, [K / 256][M]).
 // grid (16 * K / HB * M), local (16 * K / HB)
 __attribute__((intel_reqd_sub_group_size(SG)))
+// -DQ2 (ARC_H8_Q2=1, 2026-11-21, opt-in; QUEUE "H8's flips", step 1): a second int8 plane of what the first leaves
+// out, r = v - q * amax / 127, with a per-token scale of its own (the token's largest |r|), the same layout and
+// rounding; aqh2 / asch2. The GEMM runs a second time on it and adds (engine_h8.h h8_matmul), so a value is carried in
+// ~15 bits instead of 8 (as precise mode's quant_act32_q2 for the plain path)
 __kernel void h8r_act(__global const uint* restrict aq, __global const float* restrict asc, int act32,
-                      __global uint* restrict aqh, __global float* restrict asch, int M, int K) {
+                      __global uint* restrict aqh, __global float* restrict asch, int M, int K
+#ifdef Q2
+                      , __global uint* restrict aqh2, __global float* restrict asch2
+#endif
+                      ) {
   __local float red[32];
   const int m = get_group_id(0), bk = get_sub_group_id();
   const uint l = get_sub_group_local_id();
@@ -301,13 +309,38 @@ __kernel void h8r_act(__global const uint* restrict aq, __global const float* re
 #ifdef XW_PACKA_OUT
   // (gemm_xw8 -DXW_PACKA's order, engine_xw.h ARC_GEMM_XW_PACK: [M / 8][K / 64][2 halves][8 rows][8 words]; lane l's
   //  word is word l % 8 of half l / 8 of chunk bk * HB / 64 + r, 128 uints a chunk)
-  __global uint* ar = aqh + ((size_t)(m / 8) * (K / 64) + bk * (HB / 64)) * 128 + (l / 8) * 64 + (m % 8) * 8 + (l % 8);
+  const size_t ao = ((size_t)(m / 8) * (K / 64) + bk * (HB / 64)) * 128 + (l / 8) * 64 + (m % 8) * 8 + (l % 8);
+  __global uint* ar = aqh + ao;
 #pragma unroll
   for (int r = 0; r < ROT_NV / 4; ++r) ar[128 * r] = rot_pack(v + 4 * r, iv);
 #else
-  __global uint* ar = aqh + (size_t)m * (K / 4) + bk * (HB / 4);
+  const size_t ao = (size_t)m * (K / 4) + bk * (HB / 4);
+  __global uint* ar = aqh + ao;
 #pragma unroll
   for (int r = 0; r < ROT_NV / 4; ++r) intel_sub_group_block_write(ar + r * SG, rot_pack(v + 4 * r, iv));
+#endif
+#ifdef Q2
+  // (the residual of each value against its int8 code, as rot_pack rounds it; then the token's largest one, through
+  //  local memory as above: a second slot set, after a barrier so the first reads are done)
+  const float st = amax / 127.0f;
+#pragma unroll
+  for (int j = 0; j < ROT_NV; ++j) v[j] -= (float)clamp((int)rint(v[j] * iv), -127, 127) * st;
+  float amax2 = sub_group_reduce_max(rot_amax(v));
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (l == 0) red[bk] = amax2;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  amax2 = 0.0f;
+  for (int i = 0; i < K / HB; ++i) amax2 = fmax(amax2, red[i]);
+  if (bk == 0 && l == 0) asch2[m] = rot_scale(amax2);
+  const float iv2 = amax2 > 0.0f ? 127.0f / amax2 : 0.0f;
+  __global uint* ar2 = aqh2 + ao;
+#ifdef XW_PACKA_OUT
+#pragma unroll
+  for (int r = 0; r < ROT_NV / 4; ++r) ar2[128 * r] = rot_pack(v + 4 * r, iv2);
+#else
+#pragma unroll
+  for (int r = 0; r < ROT_NV / 4; ++r) intel_sub_group_block_write(ar2 + r * SG, rot_pack(v + 4 * r, iv2));
+#endif
 #endif
 }
 #endif

@@ -16,6 +16,7 @@
   --line: #e9edef; --hover: #f5f6f6; --active: #f0f2f5; --accent: #00a884; --accent-text: #ffffff;
   --chat: #efeae2; --dots: rgba(0, 0, 0, .045); --in: #ffffff; --out: #d9fdd3; --code: #f6f6f4; --think: #f7f8fa;
   --input: #ffffff; --danger: #d0453f; --shadow: 0 1px .5px rgba(11, 20, 26, .13);
+  --warn-bg: #fff4e5; --warn-text: #7a4100;
   color-scheme: light;  /* (the browser's own parts: a dropdown's open list, scrollbars, date pickers) */
 }
 @media (prefers-color-scheme: dark) {
@@ -24,10 +25,12 @@
     --line: #222d34; --hover: #202c33; --active: #2a3942; --accent: #00a884; --accent-text: #111b21;
     --chat: #0b141a; --dots: rgba(255, 255, 255, .03); --in: #202c33; --out: #005c4b; --code: #182229; --think: #182229;
     --input: #2a3942; --danger: #f15c6d; --shadow: 0 1px .5px rgba(11, 20, 26, .4);
+    --warn-bg: #3d2a12; --warn-text: #ffd8a8;
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
+  --warn-bg: #3d2a12; --warn-text: #ffd8a8;
   --app: #0c1317; --rail: #202c33; --side: #111b21; --head: #202c33; --text: #e9edef; --muted: #8696a0;
   --line: #222d34; --hover: #202c33; --active: #2a3942; --accent: #00a884; --accent-text: #111b21;
   --chat: #0b141a; --dots: rgba(255, 255, 255, .03); --in: #202c33; --out: #005c4b; --code: #182229; --think: #182229;
@@ -111,6 +114,11 @@ svg { width: 22px; height: 22px; fill: currentColor; display: block; }
 .conv .title { flex: 1; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv .time { font-size: 12px; color: var(--muted); flex: none; }
 .conv.busy .snip { color: var(--accent); }
+#drvwarn { display: flex; align-items: center; gap: 10px; margin: 6px 12px 0; padding: 8px 6px 8px 12px; border-radius: 8px; background: var(--warn-bg); color: var(--warn-text); font-size: 13px; line-height: 1.4; }
+#drvwarn[hidden] { display: none; }
+#drvwarn span { flex: 1; min-width: 0; }
+#drvwarn a { color: inherit; font-weight: 600; white-space: nowrap; }
+#drvwarn .iconbtn { flex: none; width: 28px; height: 28px; color: inherit; }
 .jobsbar { display: flex; align-items: center; gap: 10px; margin: 0 12px 6px; padding: 6px 10px; border-radius: 8px; background: var(--active); color: var(--accent); font-size: 13px; }
 .jobsbar span { flex: 1; }
 .jobsbar button { color: var(--danger); font-size: 13px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line); }
@@ -669,6 +677,7 @@ details[open].think > div { animation: fade-up .2s var(--ease-out); }
       <div class="menu" id="modelmenu" hidden></div>
       <div class="menu bubble" id="msgmenu" hidden></div>
     </header>
+    <div id="drvwarn" role="alert" hidden><span id="drvwarntext"></span><a href="https://www.intel.com/content/www/us/en/download/785597/intel-arc-iris-xe-graphics-windows.html" target="_blank" rel="noopener">Intel's driver page</a><button class="iconbtn" id="drvwarnx" title="Hide until the page is reloaded" aria-label="Hide the driver warning"><svg viewBox="0 0 24 24"><path d="M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z"/></svg></button></div>
     <main id="main"><div class="thread" id="thread"></div></main>
     <button id="latest" hidden title="Scroll to the newest output and keep following it" aria-label="Latest"><svg viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg></button>
     <footer class="foot">
@@ -1151,6 +1160,13 @@ async function refreshModel() {
         $("termps").textContent = os === "linux" ? "$" : "PS>";
         $("termin").placeholder = os === "linux" ? "bash command" : "PowerShell command";
       }
+    }
+    // (an Intel graphics driver older than the oldest measured right: the server's warning in a bar, until hidden)
+    if (p.driver_warning && !drvWarnHidden) {
+      $("drvwarntext").textContent = String(p.driver_warning);
+      $("drvwarn").hidden = false;
+    } else if (!p.driver_warning) {
+      $("drvwarn").hidden = true;
     }
     hasAudio = !!p.audio;
     hasVision = !!p.vision;  // (web_fetch: an image it opens is shown to the model)
@@ -1889,6 +1905,8 @@ const FILE_SYSTEM = "Files: a fact in a long document: search_file; a chapter or
 // "ask": the command waits in its card for Run / Don't run; "off": the model never does)
 // (the server's system, from /props: "windows" until it says otherwise)
 var serverOs = "windows";  // (var: refreshModel may run before this line is reached)
+var drvWarnHidden = false;  // (the old-driver bar hidden by its button, until the page is reloaded)
+$("drvwarnx").onclick = () => { drvWarnHidden = true; $("drvwarn").hidden = true; };
 const termTools = () => serverOs === "linux" ? TERM_TOOLS_SH : TERM_TOOLS;
 const termSystem = () => serverOs === "linux" ? TERM_SYSTEM_SH : TERM_SYSTEM;
 const TERM_TOOLS = [

@@ -37,6 +37,38 @@ Environment variables, read once per process (the one-GPU switches: [xe2-tuning.
 | `ARC_TP_PARALLEL_LOAD=1`, `ARC_TP_LINKS_SIM=1` | off | the shards loaded together; the links timed under `ARC_TP_SIM` (tests) |
 | `ARC_TP_HANG`, `ARC_TP_OOM`, `ARC_TP_F16_LIMIT`, `ARC_FAKE_OOM` | off | failsafe tests ("When a GPU hangs") |
 
+## Two ways to split: by tensors or by layers (`--split`, 2026-11-21)
+
+`runz --gpus N --split tensor` (the default) is everything below: each layer's matrices are cut over the GPUs, and
+their partial results are summed after every layer. For one request it's the fast form on matching cards with good
+links, as every GPU works on every token.
+
+`runz --gpus N --split layer` and `serverz --gpus N --split layer` give each GPU whole layers instead
+(`zero/mgpu/engine_pp.h`, a stage engine per GPU). GPU 1 embeds the token and runs the first layers, then hands its
+rows to GPU 2, and so on. GPU 0 runs the last layers, the norm and the head. (GPU 0 has the head because the server
+drives the stage that has the logits, and its threads work on GPU 0.) There are no sums per layer, only one hand-off
+between two GPUs per chunk or token.
+- **In the server:** it drives the last stage, and each call that changes a conversation runs on the earlier stages
+  first, in layer order: prompt chunks, generation steps, `--slots` and their batched steps, binding a slot, resets
+  and snapshots (`zero/mgpu/tp_mirror.h`). `--ctx auto` sizes every stage on its own GPU and takes the smallest
+  context that all of them fit. A stopped request stops between prompt chunks, not inside one.
+- **What it is for:** links too slow for the sums (PCIe 3.0 without peer access, chipset x4 slots, two A770s on
+  Windows), cards of different kinds, and models too big for one card without paging.
+- **What it is not:** faster than one card for a single request. A token visits the GPUs in turn, so generation runs
+  at about one card's speed, a little less for the hand-offs.
+- **Choosing the cut:** `--tensor-split a,b,...` gives each GPU's share of the layers, in GPU order (e.g. `1,3`: a
+  quarter on GPU 0, the last layers). The default is equal shares. The launchers' option "Multi-GPU by layers" sets
+  `--split layer`.
+- **Accuracy:** the same kernels on the same rows in the same order as one GPU, so the logits are the same bit for bit.
+  Checked under `ARC_TP_SIM=1` (every stage on GPU 0) against one GPU, byte for byte over the prompt and every
+  generated token: the 4B and the 27B, 2 and 3 stages, prompts of 40 and 2,290 tokens, chunk by chunk and layer-major
+  (512-token chunks).
+- **Not yet:**
+  - saved prompts and sessions in the server (as with the tensor split), images;
+  - MoE models, MTP drafting, Gemma, Flash Next and DeepSeek;
+  - the hand-off GPU to GPU (it goes through host memory now, ~20 KB a token for the 27B);
+  - prompts pipelined over the GPUs, and two requests in flight (QUEUE, L2-L5).
+
 ## How it is split
 
 Code, apart from the one-GPU engine: `zero/mgpu/engine_tp_shard.h` (what one shard holds), `zero/mgpu/engine_tp.h`
@@ -129,6 +161,27 @@ the driver's abort on 3 and 4 B60s (issue #4). A link slower than 4 GB/s gets a 
 on their sums there.
 
 On Windows the B60s report no peer access, so nothing changes there.
+
+### No peer access on Linux: a kernel without P2PDMA
+
+The xe driver gives one GPU access to another's memory only when the kernel has `CONFIG_PCI_P2PDMA=y`. Unraid
+7.4.0's stock kernel (6.18.60) does not, so two Arc Pro B50s reported "the driver reports no peer access" though
+the board copies GPU to GPU (catduckgnaf, issue #59). Other distributions' kernels may lack it too. To see:
+
+```
+grep P2PDMA /boot/config-$(uname -r)               # or: zcat /proc/config.gz | grep P2PDMA
+grep -c ' pci_p2pdma_add_resource$' /proc/kallsyms   # 0: not in this kernel
+```
+
+The same kernel rebuilt with it, `mgpu_probe` on the two B50s (PCIe 3.0 x8 each, one Xeon socket): a 20 KB copy
+11-14 µs direct against 16-18 through host memory, 40 MB at 4.8 GB/s against 2.8-2.9. On those links it changed
+little: the 35B-A3B's 4K prompt +2 % (table in "Mixture of experts" below), its generation the same, the 27B's
+4 batched conversations 59.1 -> 62.2 tok/s, the logits the same on both kernels. Faster links gain more (the two
+B60s below).
+
+On the same two cards, `ARC_XSPLIT_TP=1` (a split model running a token's cached experts before its missed ones
+arrive, the F30 test) gave the same logits run to run on both kernels (md5 equal), and `ARC_TP_EVSUM=1` crashed or
+hung (a segfault before loading, a GPU reset after 120 s, logits that differed before the hang): leave it off.
 
 Measured on two Pro B60s on Linux (scenic6942, issue #17, both cards on PCIe 4.0 x8; the 27B GSQ-RCO IQ3_S,
 `--bench-pp 4096 --n 128`, three prompt runs each): the links measure 14.1 GB/s direct and 14.2 through host memory.
@@ -281,6 +334,20 @@ next chunk's attention work.
   the GEMMs get half as many rows, so only where the sums cost more than the smaller GEMMs lose.
 
 ## Mixture of experts (Qwen3.6 35B-A3B, 2026-11-01)
+
+**A MoE model that nearly fills one card: the split can win generation even through host memory.** Two Arc Pro
+B50s 16 GB (catduckgnaf, issue #59, release 2026.11.19.04, a 35B-A3B fine-tune Q4_K_M, `--bench-pp 4096 --n 128`):
+
+| Setup | 4K prompt | Generation |
+|---|---|---|
+| one card (61 % of the experts on it, the rest streamed) | 1,715 tok/s | 46.8 tok/s |
+| 2 cards, sums through host memory, `ARC_XSPLIT_TP=1` | 1,460 | 66.8 |
+| 2 cards, sums direct (a kernel with P2PDMA, below) | 1,490-1,494 | 63.2-64.2 |
+
+Split, every expert has a place on a card, which outweighs the 80 sums a token pays; the prompt is ~13 % slower.
+(An earlier 8.16 tok/s split on 2026.11.16.16 had the first token's kernel compile inside its timing.) One model per
+card is still the setup for running two models at once. With peer access and every expert resident, two B60s beat
+one too (35B generation 70.1 -> 91.2 tok/s).
 
 The MoE layers are divided by expert instead of by FFN column: GPU r of N holds the routed experts [e0, e1) (256
 experts over 2: 0-127 and 128-255). Every GPU routes every token itself (the router and its input are the same on
@@ -715,7 +782,7 @@ shard (they are a lookup, not a matrix product). One sum per layer, as for the 3
 Memory per GPU: the dense part whole (its BF16 matrices as Q8_0) plus the GPU's expert cache; the experts kept in RAM
 are one pinned pool every GPU copies from, so 4 GPUs do not need 4 copies in RAM.
 
-Checked (laptop, `ARC_TP_SIM`), the tiny model with Unsloth's UD-Q8_K_XL types (`make_tiny_deepseek41.py --unsloth`,
+Checked (laptop, `ARC_TP_SIM`), the tiny model with Unsloth's UD-Q8_K_XL types (`make_tiny_deepseek41 --unsloth`, then a .py, now `tools/make_tiny_deepseek41.cpp`,
 16 experts all used, 100 random tokens), KL against tools/ref_forward, prompt / generation:
 
 | GPUs | KL |

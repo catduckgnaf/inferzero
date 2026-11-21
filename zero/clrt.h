@@ -55,7 +55,9 @@ struct ZKernel {
   struct Arg { uint8_t sz = 0; bool set = false; uint32_t gen = 0; unsigned char v[16]; };
   std::vector<Arg> args;
 };
-struct ZProg { ze_module_handle_t m; bool indirect = false; std::string opts; };  // indirect: built with -DXCACHE (see kernel())
+// indirect: built with -DXCACHE (see kernel()); bin_bytes: the native binary's size (bench/xw_peak --all: the code a
+// variant compiles to, a measure of its instructions)
+struct ZProg { ze_module_handle_t m; bool indirect = false; std::string opts; size_t bin_bytes = 0; };
 typedef ZMem* cl_mem;
 typedef ZKernel* cl_kernel;
 typedef ZProg* cl_program;
@@ -109,6 +111,11 @@ struct Dev {
   ze_command_list_handle_t cl_copy = nullptr;  // (see copy_list)
   const char* cl_copy_kind = "";
   ze_event_handle_t copy_ev[4] = {};  // (see copy_event)
+  // (integrated() / xehpc() / hw_threads(), read once: they were a zeDeviceGetProperties each call, ~660 a token per
+  //  shard on the GEMV path, and a split model's shard threads called them together: 4 B60s' 27B step 18.4 -> 48.8 ms,
+  //  issue #4, 2026-11-21)
+  int integ = -1, xehpc_dev = -1;
+  int64_t hw_thr = -1, pci_id = -1;
   ze_command_list_handle_t cl_tp = nullptr;  // (see tp_copy_list)
   ze_event_handle_t tp_ev[32] = {};          // (see tp_event)
   std::vector<ze_event_handle_t> ev_free;  // (see ev_get)
@@ -132,6 +139,8 @@ struct Dev {
   std::vector<RecList> rec_pool;
   int rec_next = 0, rec_cur = 0, rec_n = 0, rec_cap = 0;
   ze_command_list_handle_t rec = nullptr;
+  // (this GPU's own ARC_BATCH default, from its own kind: tiered placement P0, 2026-11-20; -1 until known)
+  int batch_def = -1;
 };
 // a wait that gave up (Dev::sync_timeout_ns / abort): the split model's shards are out of step afterwards
 struct GpuWaitError : std::runtime_error {
@@ -178,13 +187,34 @@ inline bool (*oom_hook)() = nullptr;
 // immediate list (copies, fills, barriers, waits) first appends the list being recorded (imm(), sync()). Kernels
 // that signal an event (profiling, ARC_ZE_WATCH) and ARC_ZE_SYNC_EACH go to the immediate list as before.
 // (the default without ARC_BATCH, set when GPU 0 is known (Ctx::init): 64 on Alchemist (a discrete GPU with 8-lane
-//  sub-groups) on Windows, 0 elsewhere. Two A770s on Windows, the 27B's generation 12.67 -> 21.58 and 14.33 -> 22.66
+//  sub-groups) on Windows and, since 2026-11-21, Linux; 0 elsewhere. Two A770s on Windows, the 27B's generation 12.67 -> 21.58 and 14.33 -> 22.66
 //  tok/s, the logits the same (hansong80, TheUniKian, issue #45, 2026-11-18): a kernel appended on its own cost
 //  33-44 us there (replay_probe), against 2.5 recorded. ARC_BATCH=0 turns it off)
-inline std::atomic<int> batch_auto{0};
-inline int batch_max() {
-  static const int n = getenv("ARC_BATCH") ? std::max(0, std::min(4096, atoi(getenv("ARC_BATCH")))) : batch_auto.load();
+// (per GPU since 2026-11-20, tiered placement P0: each Dev's batch_def, set from that GPU's own kind when it opens
+//  (batch_default_for), so a split over unlike GPUs gives each its own; ARC_BATCH applies to every GPU. One GPU, or a
+//  split of one kind, runs exactly as before)
+inline int batch_env() {
+  static const int n = getenv("ARC_BATCH") ? std::max(0, std::min(4096, atoi(getenv("ARC_BATCH")))) : -1;
   return n;
+}
+inline int batch_max(const Dev& d) { return batch_env() >= 0 ? batch_env() : std::max(0, d.batch_def); }
+inline int batch_max();
+// a GPU's default: 64 on a discrete GPU with 8-lane sub-groups (Alchemist) under Windows, 0 elsewhere
+// (Linux too since 2026-11-21: an A750 with the i915 driver, the 4B's generation 46.0 -> 66.6 tok/s, with MTP 68.4 ->
+//  88.5 with GU / DB as well (hakangit, issue #72); an A770 with the xe driver neither gains nor loses (128: -0.5 %
+//  against a 1.7 % drift; skipzx-lab, #45). The same commands in the same order: the same results)
+inline int batch_default_for(ze_device_handle_t dev) {
+  {
+  ze_device_properties_t p{};
+  p.stype = ZE_STYPE_DEVICE_PROPERTIES;
+  ze_device_compute_properties_t cp{};
+  cp.stype = ZE_STYPE_DEVICE_COMPUTE_PROPERTIES;
+  if (zeDeviceGetProperties(dev, &p) != 0 || zeDeviceGetComputeProperties(dev, &cp) != 0) return 0;
+  bool sg8 = false;
+  for (uint32_t i = 0; i < cp.numSubGroupSizes && i < ZE_SUBGROUPSIZE_COUNT; ++i) sg8 = sg8 || cp.subGroupSizes[i] == 8;
+  if (getenv("ARC_NO_SG8") && atoi(getenv("ARC_NO_SG8")) != 0) sg8 = false;
+  return sg8 && !(p.flags & 1u) ? 64 : 0;  // (flags bit 0: integrated)
+  }
 }
 struct BatchFns {
   struct ListDesc { ze_structure_type_t stype; const void* pNext; uint32_t ordinal, flags; };
@@ -218,14 +248,16 @@ inline BatchFns& batch_fns() {
   }();
   return f;
 }
-inline bool batching() { return batch_max() > 0 && batch_fns().ok; }
+inline int batch_max() { return batch_max(D()); }
+inline bool batching(const Dev& d) { return batch_max(d) > 0 && batch_fns().ok; }
+inline bool batching() { return batching(D()); }
 // the list being recorded appended to d's immediate list (no-op when none)
 inline void flush(Dev& d) {
   if (!d.rec) return;
   ze_command_list_handle_t l = d.rec;
   d.rec = nullptr;  // (before anything that could wait: an oom_hook that synchronizes comes back here)
   d.rec_n = 0;
-  d.rec_cap = std::min(d.rec_cap * 2, batch_max());
+  d.rec_cap = std::min(d.rec_cap * 2, batch_max(d));
   ZE_CHECK(batch_fns().close(l));
   Dev::RecList& r = d.rec_pool[d.rec_cur];
   ze_result_t e = batch_fns().append(d.cl, 1, &l, r.done, 0, nullptr);
@@ -276,7 +308,7 @@ inline ze_command_list_handle_t rec_list(Dev& d) {
     ZE_CHECK(batch_fns().reset(r.l));
     r.used = false;
   }
-  if (d.rec_cap < 4) d.rec_cap = std::min(4, batch_max());
+  if (d.rec_cap < 4) d.rec_cap = std::min(4, batch_max(d));
   d.rec = r.l;
   return r.l;
 }
@@ -419,16 +451,54 @@ inline ze_event_handle_t copy_event(int i) {
 }
 // this thread's GPU shares the system RAM (an iGPU: ZE_DEVICE_PROPERTY_FLAG_INTEGRATED)
 inline bool integrated() {
-  ze_device_properties_t dp{};
-  dp.stype = ZE_STYPE_DEVICE_PROPERTIES;
-  return zeDeviceGetProperties(D().dev, &dp) == 0 && (dp.flags & 1u);
+  Dev& d = D();
+  if (d.integ < 0) {
+    ze_device_properties_t dp{};
+    dp.stype = ZE_STYPE_DEVICE_PROPERTIES;
+    d.integ = zeDeviceGetProperties(d.dev, &dp) == 0 && (dp.flags & 1u) ? 1 : 0;
+  }
+  return d.integ == 1;
+}
+// this thread's GPU is a Data Center GPU Max (Ponte Vecchio, Xe-HPC: device IDs 0x0BD0-0x0BDB, the Max 1550 0x0BD5;
+// or its name), 2026-11-21: the defaults hibagus's sweeps measured there (zero/xe2/engine_xe2.h xehpc_on)
+inline bool xehpc() {
+  Dev& d = D();
+  if (d.xehpc_dev < 0) {
+    ze_device_properties_t dp{};
+    dp.stype = ZE_STYPE_DEVICE_PROPERTIES;
+    d.xehpc_dev = zeDeviceGetProperties(d.dev, &dp) == 0 &&
+                          ((dp.deviceId >= 0x0BD0 && dp.deviceId <= 0x0BDB) || strstr(dp.name, "Data Center GPU Max") != nullptr)
+                      ? 1 : 0;
+  }
+  return d.xehpc_dev == 1;
+}
+// this thread's GPU's PCI device ID (Level Zero's deviceId: a Pro B60 0xE211, a Pro B65 0xE222, a Pro B70 0xE223); 0 if
+// not known
+inline uint32_t pci_device_id() {
+  Dev& d = D();
+  if (d.pci_id < 0) {
+    ze_device_properties_t dp{};
+    dp.stype = ZE_STYPE_DEVICE_PROPERTIES;
+    d.pci_id = zeDeviceGetProperties(d.dev, &dp) != 0 ? 0 : (int64_t)dp.deviceId;
+  }
+  return (uint32_t)d.pci_id;
+}
+// this thread's GPU is Battlemage's BMG-G21 die (0xE200-0xE21F: the B580 0xE20B, B570 0xE20C, Pro B60 0xE211, Pro B50
+// 0xE212, ...), not BMG-G31 (0xE220-0xE22F: the Pro B65 0xE222, B70 0xE223), whatever its core count
+inline bool bmg_g21() {
+  const uint32_t id = pci_device_id();
+  return id >= 0xE200 && id <= 0xE21F;
 }
 // this thread's GPU's hardware threads (EUs x threads per EU: a Pro B70 2,048, a B60 1,280); 0 if not known
 inline uint32_t hw_threads() {
-  ze_device_properties_t dp{};
-  dp.stype = ZE_STYPE_DEVICE_PROPERTIES;
-  if (zeDeviceGetProperties(D().dev, &dp) != 0) return 0;
-  return dp.numSlices * dp.numSubslicesPerSlice * dp.numEUsPerSubslice * dp.numThreadsPerEU;
+  Dev& d = D();
+  if (d.hw_thr < 0) {
+    ze_device_properties_t dp{};
+    dp.stype = ZE_STYPE_DEVICE_PROPERTIES;
+    d.hw_thr = zeDeviceGetProperties(d.dev, &dp) != 0
+                   ? 0 : (int64_t)dp.numSlices * dp.numSubslicesPerSlice * dp.numEUsPerSubslice * dp.numThreadsPerEU;
+  }
+  return (uint32_t)d.hw_thr;
 }
 // kernel timestamps for profiling (engine.profile: clEnqueueNDRangeKernel asked for an event): events come from pools
 // of 4096 host-visible timestamp events and go back to a free list on clReleaseEvent
@@ -989,9 +1059,9 @@ inline cl_int clEnqueueNDRangeKernel(cl_command_queue, cl_kernel k, cl_uint dim,
   ze_event_handle_t sig = ev || zrt::watch_ms > 0 ? zrt::ev_get() : nullptr;
   if (ev) *ev = (cl_event)sig;
   // (ARC_BATCH: recorded, see zrt::batch_max; a kernel with an event, ARC_ZE_SYNC_EACH or ARC_FAKE_OOM: as before)
-  static const bool batch_ok = zrt::batching() && !(getenv("ARC_ZE_SYNC_EACH") && atoi(getenv("ARC_ZE_SYNC_EACH")) != 0) &&
-                               !getenv("ARC_FAKE_OOM");
-  if (batch_ok && !sig) {
+  // (the switches once; whether this GPU batches, per GPU: tiered placement P0)
+  static const bool batch_ok = !(getenv("ARC_ZE_SYNC_EACH") && atoi(getenv("ARC_ZE_SYNC_EACH")) != 0) && !getenv("ARC_FAKE_OOM");
+  if (batch_ok && !sig && zrt::batching(zrt::D())) {
     zrt::Dev& d = zrt::D();
     if (zeCommandListAppendLaunchKernel(zrt::rec_list(d), k->k, &gc, nullptr, 0, nullptr) == ZE_RESULT_SUCCESS) {
       if (++d.rec_n >= d.rec_cap) zrt::flush(d);
@@ -1064,6 +1134,14 @@ struct ClRt {
   bool soft_fail = false;  // (a failed compile, module or kernel creation throws instead of ending the process: XMX check)
   bool xmx = false;  // (the driver offers DPAS: Xe2 / Xe3, Arrow Lake H; the engine still checks it, Engine::xmx_check)
   bool block2d = false;  // (cl_intel_subgroup_2d_block_io: 2D block loads, Xe2 / Xe3; zero/xe2/engine_xe2.h ARC_GEMM_2D)
+  // the old-driver warning in words, empty when none (serverz's /props "driver_warning": the web UI's banner, the
+  // launchers' line); copy it under its lock
+  static std::string& driver_warning() { static std::string s; return s; }
+  static std::mutex& driver_warning_mu() { static std::mutex m; return m; }
+  static std::string driver_warning_text() {
+    std::lock_guard<std::mutex> g(driver_warning_mu());
+    return driver_warning();
+  }
   static uint64_t fnv1a(const std::string& s) {
     uint64_t h = 1469598103934665603ull;
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
@@ -1086,6 +1164,35 @@ struct ClRt {
     zrt::rcl::getDeviceInfo(zrt::rcl::device, 0x102B, sizeof(name) - 1, name, nullptr);  // CL_DEVICE_NAME
     zrt::rcl::getDeviceInfo(zrt::rcl::device, 0x102D, sizeof(drv) - 1, drv, nullptr);   // CL_DRIVER_VERSION
     device_id = std::string(name) + "|" + drv;  // (the same key as the OpenCL engine's kernel cache)
+#ifdef _WIN32
+    {  // (2026-11-20: a Windows Update put a February 2024 Intel driver, 31.0.101.5328, in place of 32.0.101.9150 on
+       //  the laptop; on it Flash Next's logits were wrong (KL 1.5-5 against f32, 0.0022 on 32.0.101.9175) and a run
+       //  ended in a device lost. Said once: the 32.0.101 drivers are the ones measured)
+      // (the oldest driver measured right: docs/install.md's 32.0.101.9033)
+      static std::atomic<bool> said_drv{false};
+      unsigned v[4] = {0, 0, 0, 0};
+      // (ARC_TEST_DRIVER=x.y.z.w: checked as if the driver were that one, a test of this warning)
+      const char* dv = getenv("ARC_TEST_DRIVER") ? getenv("ARC_TEST_DRIVER") : drv;
+      const bool parsed = sscanf(dv, "%u.%u.%u.%u", &v[0], &v[1], &v[2], &v[3]) == 4;
+      // (the oldest measured right on any card: manoreken2's B60s on 32.0.101.8976 (issue #3), a1ex4's 140V on 8991 (#60);
+      //  docs/install.md's 9033 was the iGPUs' minimum and warned those. Self audit 2026-11-20, F1)
+      const unsigned ok[4] = {32, 0, 101, 8976};
+      bool older = false;
+      for (int i = 0; parsed && i < 4; ++i)
+        if (v[i] != ok[i]) { older = v[i] < ok[i]; break; }
+      if (older && !said_drv.exchange(true)) {
+        LOG_WRN("inferzero: the Intel graphics driver is %s, older than 32.0.101.8976, the oldest measured right: "
+                "answers may be wrong (Windows Update can install an old driver over a newer one). Install Intel's "
+                "current Arc / Core Ultra graphics driver\n", dv);
+        // (W2, 2026-11-20: also for the web UI and the launchers, through serverz's /props "driver_warning")
+        std::lock_guard<std::mutex> g(driver_warning_mu());
+        driver_warning() = std::string("The Intel graphics driver is ") + dv +
+                           ", older than 32.0.101.8976, the oldest measured right: answers may be wrong. Windows Update "
+                           "can install an old driver over a newer one. Install Intel's current Arc / Core Ultra "
+                           "graphics driver.";
+      }
+    }
+#endif
     {  // CL_DEVICE_SUB_GROUP_SIZES_INTEL; ARC_NO_SG8=1 takes the 16-lane kernels anyway (tests)
       size_t sz[8] = {}, ret = 0;
       if (zrt::rcl::getDeviceInfo(zrt::rcl::device, 0x4108, sizeof sz, sz, &ret) == 0 && ret >= sizeof(size_t)) {
@@ -1099,10 +1206,10 @@ struct ClRt {
       static std::atomic<bool> said{false};
       if (!sg8 && !said.exchange(true))
         zlog::eprintf("inferzero: GPU 0 (%s): no 8-lane sub-groups, so the 16-lane kernels\n", name);
-#ifdef _WIN32
-      // (Alchemist: kernels in recorded lists by default, zrt::batch_max)
-      if (sg8 && have0 && !(p0.flags & 1u)) zrt::batch_auto = 64;
-#endif
+      // (Alchemist: kernels in recorded lists by default, zrt::batch_max; GPU 0's from the same rule as the others',
+      //  batch_default_for, on Windows and Linux. Until 2026-11-21 (release .21.06) this line was Windows-only, so
+      //  .21.05's Linux default reached only a split model's other GPUs: one A750 stayed unbatched, hakangit, #72)
+      if (zrt::dev0.batch_def < 0) zrt::dev0.batch_def = sg8 && have0 && !(p0.flags & 1u) ? 64 : 0;
     }
     {  // CL_DEVICE_EXTENSIONS: DPAS from OpenCL C (Engine::xmx_check decides whether it is used); ARC_NO_XMX=1: off
       std::string ext(16384, '\0');
@@ -1210,6 +1317,8 @@ struct ClRt {
       mp.stype = ZE_STYPE_DEVICE_MEMORY_PROPERTIES;
       ZE_CHECK(zeDeviceGetMemoryProperties(d->dev, &nm, &mp));
       d->global_mem = mp.totalSize;
+      // (its own ARC_BATCH default, P0; a simulated shard is GPU 0 again: GPU 0's)
+      d->batch_def = sim ? std::max(0, zrt::dev0.batch_def) : zrt::batch_default_for(d->dev);
       if (sim && i < (int)qs.size()) d->q_ord = qs[i].first, d->q_idx = qs[i].second;
       ze_command_queue_desc_t qd{ZE_STYPE_COMMAND_QUEUE_DESC, nullptr, (uint32_t)d->q_ord, (uint32_t)d->q_idx,
                                  2 /* in order */, 2 /* asynchronous */, 0};
@@ -1286,6 +1395,7 @@ struct ClRt {
     ze_module_desc_t md{ZE_STYPE_MODULE_DESC, nullptr, 1 /* native */, bin.size(), bin.data(),
                         big_grf ? "-ze-opt-large-register-file" : "", nullptr};
     ZProg* p = new ZProg{};
+    p->bin_bytes = bin.size();
     p->indirect = opts.find("-DXCACHE") != std::string::npos;
     p->opts = opts;
     ze_module_build_log_handle_t log = nullptr;

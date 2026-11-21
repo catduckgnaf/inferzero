@@ -19,13 +19,13 @@ if ($Port -le 0) {
   $Port = 8090
   $sj = Join-Path $data "server.json"
   if (Test-Path -LiteralPath $sj) {
-    try { $p = (Get-Content -LiteralPath $sj -Raw | ConvertFrom-Json).port; if ($p) { $Port = [int]$p } } catch {}
+    try { $p = (Get-Content -Encoding UTF8 -LiteralPath $sj -Raw | ConvertFrom-Json).port; if ($p) { $Port = [int]$p } } catch {}
   }
 }
 # remote access must be on with a password, else every request through the tunnel is refused (403)
 $rj = Join-Path $data "remote.json"
 $cfg = $null
-if (Test-Path -LiteralPath $rj) { try { $cfg = Get-Content -LiteralPath $rj -Raw | ConvertFrom-Json } catch {} }
+if (Test-Path -LiteralPath $rj) { try { $cfg = Get-Content -Encoding UTF8 -LiteralPath $rj -Raw | ConvertFrom-Json } catch {} }
 if (-not $cfg -or -not $cfg.enabled -or -not $cfg.hash) {
   Write-Host "Remote access is off. In the web UI on this computer: Settings > Remote access: a password, the host name" -ForegroundColor Yellow
   Write-Host "(*.trycloudflare.com for a quick tunnel), the switch on, Save. Then run this again." -ForegroundColor Yellow

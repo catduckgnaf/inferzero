@@ -1,0 +1,3 @@
+<bos><|turn>user
+Apa isi gambar ini?<turn|>
+<|turn>model

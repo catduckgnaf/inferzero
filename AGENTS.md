@@ -46,9 +46,12 @@ Their speed can only be measured by users who have those cards (GitHub issue #4)
 - **Temporary files** (scripts, logs, test outputs) go in a temp folder, never in the repository. Never commit
   `tests/data` recordings. Never delete model files (`.gguf`).
 - **Shell:**
-  - no heredocs: write a `.py` or message file and run that;
+  - no heredocs: write a `.ps1` / `.sh` or message file and run that;
   - long runs in the background with a log file;
-  - Python that writes text files uses `newline=""`.
+  - PowerShell that writes text uses `[IO.File]::WriteAllText($p, $s, (New-Object Text.UTF8Encoding $false))` with
+    explicit "`n" line ends, and reads with `-Encoding UTF8` (Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI).
+- **No Python anywhere in the repository** (the user, 2026-11-21): tools in C++, PowerShell or bash. Every `.ps1` works
+  in Windows PowerShell 5.1 and PowerShell 7 (`tests/test_ps_compat.ps1` checks both).
 - **Git:** commit and push only when the user asks. Commits use the GitHub noreply address, with no co-author
   trailer (no `Co-Authored-By:` line for an AI or anyone else; the user, 2026-11-07).
 - **Docs** are Markdown in English, in plain words. (The user chats in Indonesian.)
@@ -69,7 +72,7 @@ Their speed can only be measured by users who have those cards (GitHub issue #4)
 | `docs/before-after.md` | every change with its numbers; `docs/speed-progress.md`, `docs/lessons-intel-arc-igpu.md` for history and what did not work |
 | `docs/multi-gpu.md`, `docs/xe2-tuning.md` | split models and GPUs with XMX (B-series, B390, Arc 140T, Alchemist): design, failsafes, switches and their defaults per GPU kind, what users measured |
 | `docs/architecture.md`, `docs/linux-port.md` | how the engine works and the source layout; the Linux port |
-| `bench/` | `gemm_sweep.ps1`, `decode_try.ps1` / `.sh`, `xw_sweep.ps1`, `f33_sweep.ps1`, `b60_sweep.ps1` / `.sh` (discrete cards), `website_bench.ps1` / `.sh`, `gpu_bench.cpp`, `xw_peak.cpp`, micro-benchmarks |
+| `bench/` | `gpu_sweep.ps1` / `.sh` (every setting, tile and drafting mode on any GPU, with per-kernel profiles), `f33_sweep.ps1`, `website_bench.ps1` / `.sh`, `gpu_bench.cpp`, `xw_peak.cpp`, micro-benchmarks |
 | `docker/` | `Dockerfile`, `compose.yaml`, `kubernetes.yaml`, `entrypoint.sh`: the server in a container on Linux (not tested yet) |
 | `build.sh`, `zero-launcher.sh` | the Linux build and the terminal launcher (bash only) |
 

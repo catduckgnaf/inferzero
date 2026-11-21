@@ -515,8 +515,13 @@ class WhisperEngine : public whisper::Backend {
   // pass's rows; 1-8 of them on a matrix with raw rows (and one int8 pass) go through the engine's GEMVs on the raw
   // Q8_0 rows (decode.cl gemv / gemv_mt, as Engine::matmul1 picks them for Q8_0): the weights read once per pass at
   // ~77 GB/s instead of the 16-row GEMM tile's ~58 (14-minute file greedy: 2,885 passes)
+  bool path_said_ = false;  // (E0: the encoder's GEMM path's log line written)
   void gemm(const GW& w, int Mp, cl_mem C, int ldc, int rows = 0) {
     static const bool no_gemv = getenv("ARC_WH_GEMV") && atoi(getenv("ARC_WH_GEMV")) == 0;
+    if (Mp >= 256 && !path_said_) {  // (E0, 2026-11-21: what the encoder's GEMMs run on, said once)
+      path_said_ = true;
+      zlog::eprintf("inferzero: the speech encoder (Whisper): int8 GEMMs%s on DP4a (gemm.cl)\n", two_ ? ", two passes," : "");
+    }
     if (w.raw && rows >= 1 && rows <= 8 && !two_ && !no_gemv) {
       int N = w.N, K = w.K, M = Mp, c0 = 0, a = 0;
       if (rows == 1) {

@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>inferzero: free, open-source AI on your Intel PC</title>
-<meta name="description" content="inferzero is a free, open-source program that runs large language models on Intel laptop graphics and Arc graphics cards, on Windows and Linux. A chat in your browser, an API for your tools, speech to text. No cloud, no account, no Python.">
+<meta name="description" content="inferzero is a free, open-source program that runs large language models on the graphics built into Intel Core Ultra laptops and mini PCs and on Arc graphics cards, on Windows and Linux. A chat in your browser, an API for your tools, speech to text. No cloud, no account, no Python.">
 <meta name="color-scheme" content="light">
 <meta property="og:title" content="inferzero: free, open-source AI on your Intel PC">
-<meta property="og:description" content="Run Qwen, Gemma 4 and DeepSeek models on Intel laptop graphics and Arc cards. Free, open source, no cloud.">
+<meta property="og:description" content="Run Qwen, Gemma 4 and DeepSeek models on Intel Core Ultra graphics and Arc cards. Free, open source, no cloud.">
 <meta property="og:type" content="website">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
@@ -18,15 +18,16 @@
 <header>
   <div class="wrap">
     <a class="brand" href="#top" aria-label="inferzero, top of the page"><svg class="mark" width="26" height="26" viewBox="0 0 64 64" aria-hidden="true"><rect class="l" x="1.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="49.5" y="1.5" width="13" height="13" rx="3"/><rect class="d" x="1.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="17.5" y="17.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="49.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="1.5" y="33.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="33.5" width="13" height="13" rx="3"/><rect class="d" x="33.5" y="33.5" width="13" height="13" rx="3"/><rect class="d" x="49.5" y="33.5" width="13" height="13" rx="3"/><rect class="l" x="1.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="49.5" y="49.5" width="13" height="13" rx="3"/></svg>inferzero</a>
-    <nav aria-label="Sections">
-      <a href="#what">What you get</a>
-      <a href="#need">What you need</a>
-      <a href="#start">Get started</a>
-      <a href="#speed">Speed</a>
-      <a href="results.html">All results</a>
-      <a href="#open">Open source</a>
+    <nav aria-label="Main">
+      <a href="#start">Install</a>
+      <a href="results.html">Results</a>
+      <a href="multi-gpu.html">Several GPUs</a>
+      <a href="#open">Help out</a>
     </nav>
-    <a class="gh" href="https://github.com/rizagp/inferzero">github · 2026.11.19.04</a>
+    <div class="hdr-right">
+      <a class="gh" href="https://github.com/rizagp/inferzero">GitHub</a>
+      <a class="btn p sm" href="https://github.com/rizagp/inferzero/releases/latest">Download</a>
+    </div>
   </div>
 </header>
 
@@ -40,13 +41,17 @@
     <span class="tag">No cloud, no account</span>
   </div>
   <h1>Run AI models on your own Intel PC.</h1>
-  <p class="lead">inferzero is a free, open-source program that runs large language models (Qwen, Gemma 4, DeepSeek) on Intel's laptop graphics and Arc graphics cards. Chat with them in your browser, connect your own tools to them, and turn speech into text, all on your computer.</p>
+  <p class="lead">inferzero is a free, open-source program that runs large language models (Qwen, Gemma 4, DeepSeek) on the graphics built into Intel's Core Ultra laptops and mini PCs, and on Arc graphics cards. Chat with them in your browser, connect your own tools to them, and turn speech into text, all on your computer.</p>
   <div class="btns">
     <a class="btn p" href="https://github.com/rizagp/inferzero/releases/latest">Download for Windows <kbd>9 MB</kbd></a>
     <a class="btn s" href="https://github.com/rizagp/inferzero/releases/latest">Download for Linux <kbd>6 MB</kbd></a>
     <a class="btn s" href="https://github.com/rizagp/inferzero">Source code on GitHub</a>
   </div>
   <p class="after">The program is small; the models are downloaded separately, most of them 4 to 20 GB.</p>
+  <figure class="shot">
+    <img src="hero.png" width="1280" height="600" alt="The inferzero chat in a browser: a list of chats on the left; on the right a question about mixture-of-experts models and the model's three-point answer.">
+    <figcaption>The chat in your browser, here on a Core Ultra 5 laptop's own graphics with Qwen3.5 4B: it read the prompt at 733 tokens a second and wrote the answer at 17 a second.</figcaption>
+  </figure>
 </div>
 
 <section id="what">
@@ -76,7 +81,7 @@
       <dt>System</dt>
       <dd>Windows 11 (64-bit), or Linux (Ubuntu 24.04 or newer; other distributions work too).</dd>
       <dt>Intel graphics</dt>
-      <dd>A laptop or PC with <b>Core Ultra and Arc graphics</b> (Meteor Lake, Lunar Lake, Arrow Lake H, Panther Lake), or an <b>Arc graphics card</b>: A-series (A770, A750, A580) or B-series (B580, Pro B60, Pro B65, Pro B70); it has also run on Intel's Data Center GPU Max. One model can also be split over several cards.</dd>
+      <dd>A laptop, mini PC or desktop with <b>Core Ultra and Arc graphics</b> (Meteor Lake, Lunar Lake, Arrow Lake H, Panther Lake), or an <b>Arc graphics card</b>: A-series (A770, A750, A580) or B-series (B580, Pro B50, Pro B60, Pro B65, Pro B70); it has also run on Intel's Data Center GPU Max. One model can also be split over <a href="multi-gpu.html">several cards</a>.</dd>
       <dt>Memory</dt>
       <dd>16 GB of RAM for the small models (Qwen3.5 4B and 9B, Gemma 4 E4B); 32 GB for the 12B to 35B ones and Qwen3.8 Flash Next. A graphics card's own memory counts too.</dd>
       <dt>Disk</dt>
@@ -90,9 +95,10 @@
 <section id="start">
   <div class="wrap">
     <div class="intro">
-      <h2>Get started</h2>
-      <p>About five minutes, plus the model's download.</p>
+      <h2>Install and uninstall</h2>
+      <p>Installing takes about five minutes, plus the model's download. Nothing is installed into Windows itself: removing inferzero is deleting its folders.</p>
     </div>
+    <h3 class="sub" id="install">Install</h3>
     <div class="steps">
       <div class="card">
         <h3>Windows</h3>
@@ -109,6 +115,29 @@
           <li>Run <code>./zero-launcher.sh</code>: a menu in the terminal.</li>
           <li>Pick a model; it downloads it and starts the server. Open the address it shows in your browser.</li>
         </ol>
+      </div>
+    </div>
+    <h3 class="sub" id="uninstall">Uninstall cleanly</h3>
+    <div class="steps">
+      <div class="card">
+        <h3>Windows</h3>
+        <ol class="go">
+          <li>Stop the server: <b>Stop server</b> in the launcher (or the tray icon's <b>Stop the server</b>), then close the launcher.</li>
+          <li>Delete the folder you unpacked.</li>
+          <li>Delete <code>%USERPROFILE%\.inferzero</code>: your chats, recordings and transcripts, logs, settings and inferzero's own model files. Copy out anything you want to keep first.</li>
+          <li>Delete the models from <code>%USERPROFILE%\.cache\huggingface\hub</code>: the <code>models--…</code> folders it downloaded. Other AI programs share this folder, so keep the ones they use.</li>
+        </ol>
+        <p class="note">Only if you used <code>setup.cmd</code>: remove the folder from your <b>Path</b> (Settings › System › About › Advanced system settings › Environment Variables), and if you connected Pi, delete <code>zero-pi.cmd</code> and <code>zero-server.cmd</code> from <code>%USERPROFILE%\.pi\agent\bin</code> and the "inferzero" entry from <code>%USERPROFILE%\.pi\agent\models.json</code>.</p>
+      </div>
+      <div class="card">
+        <h3>Linux</h3>
+        <ol class="go">
+          <li>Stop the server (Ctrl+C in the launcher's terminal).</li>
+          <li>Delete the folder you unpacked.</li>
+          <li>Delete <code>~/.inferzero</code>: chats, recordings, logs, settings and inferzero's own model files.</li>
+          <li>Delete the models from <code>~/.cache/huggingface/hub</code> (or <code>$HF_HOME/hub</code>): the <code>models--…</code> folders it downloaded, keeping those other programs use.</li>
+        </ol>
+        <p class="note">Only if you installed the service (<code>--install-service</code>): <code>systemctl --user disable --now inferzero</code>, then delete <code>~/.config/systemd/user/inferzero.service</code>.</p>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -133,15 +162,16 @@
         <thead><tr><th>Hardware</th><th class="n">Reading a prompt</th><th class="n">Writing an answer</th></tr></thead>
         <tbody>
           <tr><td>Core Ultra 5 125H laptop <small>(where it started)</small></td><td class="n">135</td><td class="n">5.1 <small>(12.9 with drafting)</small></td></tr>
-          <tr><td>Core Ultra 9 285H laptop <small>(Arc 140T)</small></td><td class="n">405</td><td class="n">6.1 <small>(14.6 with drafting)</small></td></tr>
-          <tr><td>Core Ultra X7 358H laptop <small>(Arc B390)</small></td><td class="n">637</td><td class="n">5.9 <small>(16.8 with drafting)</small></td></tr>
-          <tr><td>Arc A770 16 GB</td><td class="n">1,223</td><td class="n">22.9 <small>(40.4 with drafting)</small></td></tr>
-          <tr><td>Arc Pro B60</td><td class="n">1,726</td><td class="n">23.7</td></tr>
-          <tr><td>Arc Pro B65</td><td class="n">1,735</td><td class="n">21.6 <small>(46.7 with drafting)</small></td></tr>
+          <tr><td>Core Ultra 9 285H mini PC <small>(Arc 140T)</small></td><td class="n">405</td><td class="n">6.1 <small>(14.6 with drafting)</small></td></tr>
+          <tr><td>Core Ultra 7 258V <small>(Arc 140V)</small></td><td class="n">444</td><td class="n">6.5 <small>(13.9 with drafting)</small></td></tr>
+          <tr><td>Core Ultra X7 358H mini PC <small>(Arc B390)</small></td><td class="n">637</td><td class="n">5.9 <small>(16.8 with drafting)</small></td></tr>
+          <tr><td>Arc A770 16 GB</td><td class="n">1,528</td><td class="n">22.9 <small>(48.6 with drafting)</small></td></tr>
+          <tr><td>Arc Pro B60</td><td class="n">1,957</td><td class="n">24.1 <small>(54.3 with drafting)</small></td></tr>
+          <tr><td>Arc Pro B65</td><td class="n">1,735</td><td class="n">21.6 <small>(51.8 with drafting)</small></td></tr>
           <tr><td>Arc B580 12 GB</td><td class="n">1,877</td><td class="n">13.7 <small>(the model does not fit: the CPU computes the part kept in RAM)</small></td></tr>
-          <tr><td>Arc Pro B70</td><td class="n">2,972</td><td class="n">35.2 <small>(70.6 with drafting)</small></td></tr>
-          <tr><td>Intel Data Center GPU Max 1550 <small>(one of its two stacks)</small></td><td class="n">2,642</td><td class="n">–</td></tr>
-          <tr><td>4 × Arc Pro B60, one model split</td><td class="n">1,888</td><td class="n">53</td></tr>
+          <tr><td>Arc Pro B70</td><td class="n">3,135</td><td class="n">35.2 <small>(70.6 with drafting)</small></td></tr>
+          <tr><td>Intel Data Center GPU Max 1550 <small>(one of its two stacks)</small></td><td class="n">2,648</td><td class="n">27.8</td></tr>
+          <tr><td>4 × Arc Pro B60, one model split</td><td class="n">2,195</td><td class="n">53 <small>(a release of 2026-10-31; slower in the current one, being fixed)</small></td></tr>
         </tbody>
       </table>
     </div>
@@ -173,7 +203,7 @@
 
 <footer>
   <div class="wrap">
-    <div>inferzero · Apache 2.0 · <span class="mono">release 2026.11.19.04</span><br>An independent project, not made or endorsed by Intel. Intel and Arc are trademarks of Intel Corporation or its subsidiaries.</div>
+    <div>inferzero · Apache 2.0 · <span class="mono">release 2026.11.21.01</span><br>An independent project, not made or endorsed by Intel. Intel and Arc are trademarks of Intel Corporation or its subsidiaries.</div>
     <div><a href="https://github.com/rizagp/inferzero">GitHub</a> · <a href="https://github.com/rizagp/inferzero/releases">Releases</a> · <a href="https://github.com/rizagp/inferzero/blob/main/USAGE.md">Usage guide</a> · <a href="https://github.com/rizagp/inferzero/blob/main/CHANGELOG.md">Changelog</a></div>
   </div>
 </footer>

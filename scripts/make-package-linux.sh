@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The Linux package: dist/inferzero-<version>-linux-x64.tar.gz, the Linux side of scripts/make-package.ps1. Unpacked
-# anywhere, ./zero-launcher.sh runs without a compiler: bin/ holds runz, serverz, mgpu_probe, ref_forward and gpu_bench built by ./build.sh,
+# anywhere, ./zero-launcher.sh runs without a compiler: bin/ holds runz, serverz, mgpu_probe, ref_forward, gpu_bench and xw_peak built by ./build.sh,
 # bin/PREBUILT.txt says so. It holds every file git tracks but the .py ones (the sources too, so ./build.sh still builds), nothing
 # untracked (no recordings, reports or models).
 #   scripts/make-package-linux.sh                       build, then the archive
@@ -23,7 +23,7 @@ done
 if [ -n "$release" ] && ! [[ "$release" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{2}$ ]]; then
   echo "--release: yyyy.MM.dd.NN with two digits for NN, e.g. 2026.11.14.13 (got $release)" >&2; exit 2
 fi
-progs=(runz serverz mgpu_probe ref_forward gpu_bench)
+progs=(runz serverz mgpu_probe ref_forward gpu_bench xw_peak)  # (xw_peak: gpu_sweep.sh's phase X, 2026-11-21)
 [ $build -eq 1 ] && ./build.sh "${progs[@]}"
 commit=$(git rev-parse --short HEAD)
 dirty=""; [ -n "$(git status --porcelain --untracked-files=no)" ] && dirty="-dirty"

@@ -30,8 +30,8 @@ $dist = Join-Path $root "dist"
 $stage = Join-Path $dist $name
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force $stage | Out-Null
-# the tracked files, as they are in the working tree, but no .py: nothing a user runs needs Python, and the
-# developers' scripts (Jinja2 template checks, simulators, table generators) stay in the repository (2026-11-15)
+# the tracked files, as they are in the working tree, but no .py: nothing a user runs needs Python (and since
+# 2026-11-21 the repository holds none; the filter stays so that a stray one never ships)
 # (and of the Markdown files only CHANGELOG.md, README.md and USAGE.md, 2026-11-17: the benchmark scripts and the KL
 #  commands read USAGE.md as their text, the tests and runs README.md; docs/, QUEUE.md, BUGS.md, AGENTS.md and the
 #  other notes stay on GitHub, ~0.85 MB of 1.5 MB of Markdown out of the package)

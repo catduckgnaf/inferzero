@@ -10,10 +10,10 @@ services:
     image: inferzero:latest
     restart: unless-stopped
     init: true                      # (a small init as PID 1: `docker compose stop` also stops a download)
-    stop_grace_period: 60s          # (a stop sends SIGTERM, then SIGKILL after this. With serverz handling SIGTERM
-                                    #  (QUEUE D1, not yet: today SIGTERM ends it at once), a stop during a MoE
-                                    #  model's first load lets it clean up the expert file's .tmp instead of
-                                    #  leaving tens of GB on the volume for the next start to redo)
+    stop_grace_period: 60s          # (a stop sends SIGTERM, then SIGKILL after this. serverz handles SIGTERM
+                                    #  while it builds an expert file or a package (zero/expert_store.h, since
+                                    #  2026-11-19): a stop during a MoE model's first load removes the .tmp
+                                    #  instead of leaving tens of GB on the volume for the next start to redo)
     # (no memory limit here. With one (mem_limit / deploy.resources), leave room above the model: a MoE model's
     #  first load reads its whole GGUF once to write the expert file, and its mapped pages count against the
     #  limit while it does)
@@ -30,6 +30,7 @@ services:
       MODEL: 4b                     # a catalog key (4b, 9b, 27b, 35b, flash, g12, g31, e4b) or a .gguf path
       GPUS: "1"
       SERVER_ARGS: ""               # more serverz options, e.g. "--ctx 32768"
+      OPTIONS: ""                   # speed and accuracy options (docs/options.md), e.g. "copy_draft,xcpu=off,budget=12"
     volumes:   # (${HOME}: yours when you are in the docker group; under sudo it is root's, so the models go there)
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface   # the models (shared with a host install)
       - ${HOME}/.inferzero:/root/.inferzero                   # compiled kernels, expert files, settings

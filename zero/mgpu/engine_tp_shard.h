@@ -38,6 +38,8 @@
   TpComm* tp_ = nullptr;  // (set by TpEngine before the first forward)
   // serverz --gpus (zero/mgpu/tp_mirror.h): on shard 0 the TpEngine whose other shards mirror its calls
   TpEngine* tp_front_ = nullptr;
+  // serverz --split layer (zero/mgpu/engine_pp.h): on the last stage the PpEngine whose earlier stages run its calls first
+  PpEngine* pp_front_ = nullptr;
   int tp_depth_ = 0;  // (mirrored calls under way: only the outermost one is mirrored)
   friend struct TpMirror;
   // the first pass's sum buffers made now (as the passes make them when missing: the same sizes), before the direct

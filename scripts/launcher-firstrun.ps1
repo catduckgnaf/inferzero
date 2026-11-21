@@ -11,7 +11,7 @@
 
 # ---- unblock once per folder the package was unpacked to
 $unblockMark = Join-Path $stateDir "unblocked.txt"
-$doneFor = if (Test-Path $unblockMark) { (Get-Content $unblockMark -Raw).Trim() } else { "" }
+$doneFor = if (Test-Path $unblockMark) { (Get-Content -Encoding UTF8 $unblockMark -Raw).Trim() } else { "" }
 if ($doneFor -ne $root) {
   Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
   Set-Content $unblockMark $root
@@ -42,6 +42,51 @@ function New-DesktopShortcut {
   $s.Save()
   # (the shortcut from before the rename to inferzero opened arc-launcher.cmd, removed since)
   Remove-Item (Join-Path ([Environment]::GetFolderPath("Desktop")) "arcinferzero.lnk") -ErrorAction SilentlyContinue
+}
+
+# ---- after an update into a new folder (the launcher review of 2026-11-19, finding 4): the desktop shortcut and the
+# PATH entry still open the old folder. Asked once per folder: Yes points both here, No is remembered
+# (%USERPROFILE%\.inferzero\moved-asked.txt, one folder a line) and never asked again for this folder
+function Get-OldInstall([string]$Here, [string]$Desktop, [string]$UserPath) {
+  # the shortcut: inferzero.lnk on the desktop whose target is another folder's zero-launcher.cmd
+  $here = $Here.TrimEnd('\')
+  $lnk = Join-Path $Desktop "inferzero.lnk"
+  $oldLnk = ""
+  if (Test-Path -LiteralPath $lnk) {
+    try {
+      $t = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
+      if ($t -and (Split-Path -Leaf $t) -ieq "zero-launcher.cmd" -and (Split-Path -Parent $t).TrimEnd('\') -ine $here) { $oldLnk = Split-Path -Parent $t }
+    } catch {}
+  }
+  # PATH: a user PATH entry that is another inferzero folder (it holds zero-server.cmd and zero-launcher.cmd)
+  $oldPath = @("$UserPath" -split ';' | Where-Object {
+      $_ -and $_.TrimEnd('\') -ine $here -and (Test-Path -LiteralPath (Join-Path $_ "zero-server.cmd")) -and
+      (Test-Path -LiteralPath (Join-Path $_ "zero-launcher.cmd")) })
+  return @{ lnk = $oldLnk; paths = $oldPath }
+}
+function Test-OldInstall {
+  $here = $root.TrimEnd('\')
+  $asked = Join-Path $stateDir "moved-asked.txt"
+  if ((Test-Path -LiteralPath $asked) -and (@(Get-Content -Encoding UTF8 -LiteralPath $asked | Where-Object { $_.TrimEnd('\') -ieq $here }).Count -gt 0)) { return }
+  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  $o = Get-OldInstall $here ([Environment]::GetFolderPath("Desktop")) $userPath
+  $oldLnk = $o.lnk; $oldPath = @($o.paths)
+  if (-not $oldLnk -and -not $oldPath.Count) { return }
+  $what = @()
+  if ($oldLnk) { $what += "the desktop shortcut opens $oldLnk" }
+  if ($oldPath.Count) { $what += "'zero-server' in a terminal runs $($oldPath -join ', ')" }
+  $q = "This inferzero is in $here, but $($what -join ', and ').`n`nPoint $(if ($oldLnk -and $oldPath.Count) { 'them' } else { 'it' }) to this folder?"
+  if ([System.Windows.Forms.MessageBox]::Show($q, "inferzero", "YesNo", "Question") -eq "Yes") {
+    try { if ($oldLnk) { New-DesktopShortcut } } catch { Show-Bar "The desktop shortcut could not be changed: $($_.Exception.Message)" "warn" }
+    if ($oldPath.Count) {
+      $keep = @("$userPath" -split ';' | Where-Object { $_ -and ($oldPath -notcontains $_) })
+      if (@($keep | Where-Object { $_.TrimEnd('\') -ieq $here }).Count -eq 0) { $keep += $here }
+      [Environment]::SetEnvironmentVariable("Path", ($keep -join ';'), "User")
+    }
+    Show-Bar "Now pointing to $here$(if ($oldPath.Count) { ' (new terminals)' })." "info"
+  } else {
+    [IO.File]::AppendAllText($asked, "$here`n", (New-Object Text.UTF8Encoding $false))
+  }
 }
 
 # ---- what the dialog downloaded: started when the model list shows it
@@ -155,7 +200,7 @@ function Show-GetModels([bool]$first) {
         if (Test-Path $dir) { $now += (Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum }
       }
       $bar.Value = [int][math]::Min([double]100, [math]::Max([double]0, 100 * ([double]$now - $state.start) / [math]::Max([double]1, [double]$state.total)))  # (doubles: bytes past 2^31, issue #31)
-      $lines = @(Get-Content $state.out -ErrorAction SilentlyContinue)
+      $lines = @(Get-Content -Encoding UTF8 $state.out -ErrorAction SilentlyContinue)
       $cur = ($lines | Where-Object { $_ -like "START *" } | Select-Object -Last 1) -replace '^START ', ''
       $info.Text = "Downloading $cur ... {0:N1} of {1:N1} GB (a cut connection is fine: Download again goes on where it stopped)" -f (($now - $state.start) / 1e9), ($state.total / 1e9)
       if ($state.proc.HasExited) {

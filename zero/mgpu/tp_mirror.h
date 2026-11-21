@@ -3,6 +3,8 @@
 // the engine is such a shard 0, the same call runs on the other shards' threads at once (they meet at the sums'
 // barriers), and at the end their logits are joined into shard 0's, so the server sees the whole vocabulary. On one
 // GPU (or a split model that runz drives through TpEngine) the guard is one test of a pointer.
+// A layer split (serverz --split layer, zero/mgpu/engine_pp.h): the engine is the last stage, and the call runs on the
+// earlier stages first, in turn on this thread, each passing its rows to the next; the last stage has the logits.
 // Included by zero/engine.h before class Engine; start / finish are in zero/mgpu/engine_tp.h.
 #pragma once
 #include <exception>
@@ -10,6 +12,7 @@
 #include <utility>
 
 class Engine;
+class PpEngine;
 struct TpMirror {
   enum Gather { kNone, kLogits, kBatch };  // (what to join: logits_host_, or `rows` rows of batch_logits_host_)
   template <class F>
@@ -29,10 +32,11 @@ struct TpMirror {
   int rows_ = 0;
   int uncaught_ = 0;
   bool was_guarded_ = false;  // (zrt::tp_guarded of the calling thread before: set during the call)
+  bool pp_ = false;  // (a layer split's last stage, PpEngine: the earlier stages ran the call first)
   void start(Engine* e, std::function<void(Engine&)> f, Gather g, int rows);
   void finish();
 };
 
 // the first line of a mirrored member function: TP_MIRROR(forward(tokens, n), TpMirror::kLogits, 0)
 #define TP_MIRROR(call, gather, rows) \
-  TpMirror tp_mirror_(tp_front_ != nullptr, this, [&](Engine& tp_e_) { tp_e_.call; }, gather, rows)
+  TpMirror tp_mirror_(tp_front_ != nullptr || pp_front_ != nullptr, this, [&](Engine& tp_e_) { tp_e_.call; }, gather, rows)

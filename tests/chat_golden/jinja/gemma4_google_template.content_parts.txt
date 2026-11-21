@@ -1,0 +1,5 @@
+<bos><|turn>user
+Part A.Part B.<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

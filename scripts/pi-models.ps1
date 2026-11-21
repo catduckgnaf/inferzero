@@ -10,7 +10,7 @@ function Update-PiModels([string]$ServerExe, [string]$Base, [string]$RunningId =
   if ($Gpus -gt 1) { $lm += @("--gpus", "$Gpus") }  # (a split server: each context per GPU, as its switches load it)
   $all = @(& $ServerExe @lm | ConvertFrom-Json | ForEach-Object { $_ }) | Where-Object { $_.supported }  # (unroll)
   $cfgPath = Join-Path $env:USERPROFILE ".pi\agent\models.json"
-  $cfg = if (Test-Path $cfgPath) { Get-Content $cfgPath -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
+  $cfg = if (Test-Path $cfgPath) { Get-Content -Encoding UTF8 $cfgPath -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
   if (-not $cfg.PSObject.Properties["providers"]) { $cfg | Add-Member providers ([pscustomobject]@{}) }
   # (the provider was called "arcinfer" until 2026-10-24 and "arcinferzero" until 2026-11-10, the project's renames:
   #  those entries are replaced)

@@ -1,0 +1,5 @@
+<bos><|turn>user
+<|image|>Apa isi gambar ini?<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

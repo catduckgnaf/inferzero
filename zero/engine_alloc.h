@@ -105,7 +105,7 @@
     // rows of a speculative verification pass or a batched pass over the slots
     // (DFlash2's head writes block - 1 draft rows whatever the drafts kept)
     batch_rows_ = std::min(16, std::max({1 + max_drafts(), opt.slots, 1, dfl_ ? dfl_B_ : 1}));
-    logits_ = buf((size_t)n_logits() * 4 * batch_rows_);
+    logits_ = buf(std::max<size_t>(64, (size_t)n_logits() * 4 * batch_rows_));  // (a layer split's earlier stage: no head)
     if (hp.moe) {
       const size_t S = M * hp.n_expert_used, F = hp.n_ff_exp_pad, NE = hp.n_expert;
       slots_ = (int)S;

@@ -1,6 +1,6 @@
 // f32 CPU reference of the Gemma 4 vision encoder (mmproj gemma4v: E2B / E4B, 26B-A4B), the C++ (AVX2 + OpenMP)
-// version of tools/gemma4v_ref.py, written from the mmproj and llama.cpp's tools/mtmd/models/gemma4v.cpp: patches in
-// [-1, 1], 2D positions (table per axis), per layer RMS norm, clamped q / k / v projections, q / k RMS norms, V RMS
+// version of the former tools/gemma4v_ref.py (removed 2026-11-21: this does all it did), written from the mmproj
+// and llama.cpp's tools/mtmd/models/gemma4v.cpp: patches in [-1, 1], 2D positions (table per axis), per layer RMS norm, clamped q / k / v projections, q / k RMS norms, V RMS
 // normed without weight, NEOX RoPE (theta 100: columns on the first half of a head, rows on the second), unscaled
 // softmax attention, clamped output projection, post norm; a GELU-tanh gated FFN the same way; then 3x3 average
 // pooling, times sqrt(E), std bias / scale (26B), RMS norm and the projection. Compares with the GPU encoder's output

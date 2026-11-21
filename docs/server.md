@@ -166,6 +166,9 @@
   DFlash2 drafts, 5 for the 35B, 3 for the 4B and Flash Next, 2 for the 9B; Gemma 4's drafters always draft 3).
   `--mtp-model FILE` (implies `--mtp`): an MTP head in a file of its own, such as Flash Next's
   `mtp-Qwen3.8-Flash-Next-Q4_0.gguf` or `-Q8_0.gguf`; without it the server takes an `mtp-*.gguf` next to the model.
+  A dense Qwen3.5 / 3.8 fine-tune shipped without an MTP block can borrow its base model's: `--mtp-model` with the
+  base model's `.gguf` (since 2026-11-21). The block is taken only when it matches the model, and otherwise refused
+  with a message.
   After a model switch, a head that does not belong to the loaded model is skipped with a line in the log.
 - `--dflash DIR` (inferzero: `serverz`, `runz`): speculative decoding with a DFlash2 block drafter, `DIR` being
   the folder with its `config.json` and `model.safetensors` (the snapshot folder of `hf download
@@ -245,8 +248,7 @@ Several GPUs and GPU tuning:
 .\bin\serverz.exe -m model.gguf --gpus 4 --slots 4           # the server on a split model
 .\bin\mgpu_probe.exe                                         # the GPUs, and what moving data between them costs
 .\bin\event_probe.exe                                        # whether GPUs can sync without the CPU in the middle
-.\bench\gemm_sweep.ps1 -Models model.gguf                     # the prompt GEMM's settings swept on this GPU
-.\bench\decode_try.ps1 -Models model.gguf                     # generation: plain, MTP, DFlash2, GEMV switches
+.\bench\gpu_sweep.ps1 -Model model.gguf                      # every setting, tile and drafting mode swept on this GPU
 ```
 
 What to run on a discrete Arc card (B580 / B60 / B70, A770 / A750 / A580): [docs/xe2-tuning.md](xe2-tuning.md).

@@ -18,7 +18,7 @@ CHANGELOG entry. Order: the dense 12B and E4B first, then 31B, then the 26B MoE.
 
 - B60 / B70: `gemm_xw` 32x64, with `ARC_GEMM_XW_PF` prefetch and `ARC_GEMM_XW_WGX=4`.
 - 140T: `gemm_xw8` 32x16 with packing; the preset `p140_wanted()` (`engine_xe2.h:42`, `!hp.gemma`).
-- A tile sweep on Gemma's shapes (`bench/gemm_sweep.ps1`): its FFN widths differ from Qwen's.
+- A tile sweep on Gemma's shapes (`bench/gpu_sweep.ps1` / `.sh`, phases P and T): its FFN widths differ from Qwen's.
 - Measured by users with the cards (issue #4).
 
 ## 3. Decode speed-ups

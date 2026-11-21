@@ -32,6 +32,22 @@
 // -DXW_LOCK (ARC_GEMM_XW_LOCK=1): the work-group in step, a split barrier around each 64-value chunk (arrive before its
 // loads, wait after its DPAS), so the sub-groups that share a chunk's lines read them while they are in L1. Changes
 // no value.
+// -DXW_GU (ARC_GEMM_XW_GU=1, 2026-11-20, the B70's 3,000 plan): the FFN's gate and up GEMMs in one launch. A sub-group's
+// first XW_NC / 2 column groups read the gate weights (wq, wh), the others the up weights (wqu, whu) of the same
+// columns, so it holds both projections of 16 * XW_NC / 2 output columns and its epilogue writes silu(gate) * up
+// straight to C: the gate's f32 values no longer go to memory and back (a 4K prompt of the 27B: 285 MB a layer each way).
+// Each column group's loads and DPAS are the plain kernel's (which weights is fixed per group when it compiles), and
+// the epilogue computes the gate value as the gate GEMM stores it (accumulate 0) and then the fused SwiGLU's
+// expression (accumulate 2): the same results bit for bit as the two launches (checked at start, engine_xw.h).
+// N is the output's column count (the gate's and the up's N); no split-K (the fused SwiGLU has none); not with NC 6.
+#ifdef XW_GU
+#if XW_NC != 2 && XW_NC != 4 && XW_NC != 8
+#error "XW_GU: XW_NC must be 2, 4 or 8"
+#endif
+#define XW_NCO (XW_NC / 2)  // (output column groups a sub-group)
+#else
+#define XW_NCO XW_NC
+#endif
 
 #ifdef XW_LOCK
 #pragma OPENCL EXTENSION cl_intel_split_work_group_barrier : enable
@@ -114,7 +130,11 @@ __attribute__((intel_reqd_sub_group_size(SG)))
 __kernel void gemm_xw(__global const uint* restrict wq, __global const uint* restrict wh,
                       __global const char* restrict aq, __global const float* restrict asc,
                       __global float* restrict C, int M, int N, int K, int ldc, int c_off, int accumulate,
-                      int rgroup, int s_begin, int s_end, int g_base) {
+                      int rgroup, int s_begin, int s_end, int g_base
+#ifdef XW_GU
+                      , __global const uint* restrict wqu, __global const uint* restrict whu
+#endif
+                      ) {
   // (g_base: the first 16-column group of this launch; N its columns: XW_NC 6 runs a matrix's first 96 * a columns,
   //  and the 32 x 64 kernel the rest from g_base 6 * a, engine_xw.h xw_matmul; 0 and the whole N otherwise)
   // (wgx column sub-groups a work-group, sx this one's: the host keeps NB a multiple of wgx, and local size 16 * wgx)
@@ -124,12 +144,17 @@ __kernel void gemm_xw(__global const uint* restrict wq, __global const uint* res
 #else
   const int sx = 0;
 #endif
-  const int NB = N / (SG * XW_NC * wgx), rows = M / (XW_TM * (int)get_local_size(1));
+  const int NB = N / (SG * XW_NCO * wgx), rows = M / (XW_TM * (int)get_local_size(1));
   const int w = get_group_id(0), grp = w / (rgroup * NB), rem = w % (rgroup * NB);
   const int rin = min(rgroup, rows - grp * rgroup);
   const int cb = rem / rin, row = grp * rgroup + rem % rin;
   const int m0 = (row * (int)get_local_size(1) + (int)get_local_id(1)) * XW_TM;
-  const int nsb = K / 256, g0 = g_base + (cb * wgx + sx) * XW_NC;
+  const int nsb = K / 256, g0 = g_base + (cb * wgx + sx) * XW_NCO;
+#ifdef XW_GU
+  // (column group c's weights: the gate's for c < XW_NCO, the up's for the others, of output group g0 + c % XW_NCO)
+#define XW_WBASE(c) ((c) < XW_NCO ? wq + (size_t)(g0 + (c)) * nsb * 4 * (16 * SG) \
+                                  : wqu + (size_t)(g0 + (c) - XW_NCO) * nsb * 4 * (16 * SG))
+#endif
 #ifndef X2D
   __global const char* ap = aq + (size_t)m0 * K;
 #endif
@@ -152,7 +177,11 @@ __kernel void gemm_xw(__global const uint* restrict wq, __global const uint* res
         if (qn < s_end * 4) {
 #if XW_PF & 1
 #pragma unroll
+#ifdef XW_GU
+          for (int c = 0; c < XW_NC; ++c) XW_PREF_W(XW_WBASE(c) + (size_t)qn * (16 * SG));
+#else
           for (int c = 0; c < XW_NC; ++c) XW_PREF_W(wq + ((size_t)(g0 + c) * nsb * 4 + qn) * (16 * SG));
+#endif
 #endif
 #if (XW_PF & 2) && defined(X2D)
 #pragma unroll
@@ -200,7 +229,11 @@ __kernel void gemm_xw(__global const uint* restrict wq, __global const uint* res
       // ---- each column group's 64 values (lo 0..31, hi 32..63), used by every row group
 #pragma unroll
       for (int c = 0; c < XW_NC; ++c) {
+#ifdef XW_GU
+        __global const uint* dp = XW_WBASE(c) + (size_t)(s * 4 + j) * (16 * SG);
+#else
         __global const uint* dp = wq + ((size_t)(g0 + c) * nsb * 4 + s * 4 + j) * (16 * SG);
+#endif
 #if defined(XW_2D) && defined(X2D)
         // (the 1 KB chunk as 16 rows of 16 words: lane l gets column l, words 0..15, what the two block reads gave)
         uint wb[16];
@@ -222,6 +255,47 @@ __kernel void gemm_xw(__global const uint* restrict wq, __global const uint* res
 #pragma unroll
   for (int v = 0; v < XW_TM / 16; ++v)
     av[v] = as_float(intel_sub_group_block_read((__global const uint*)(asc + m0 + 16 * v)));
+#ifdef XW_GU
+  // (output group g: the gate's sum in xacc[t][c], the up's in xacc[t][c + XW_NCO]; the gate value as the gate GEMM
+  //  stores it, the up value and the product as the fused SwiGLU's epilogue computes them)
+#pragma unroll
+  for (int c = 0; c < XW_NCO; ++c) {
+    const int g = g0 + c;
+    const float dg = as_float(intel_sub_group_block_read(wh + (size_t)g * SG));
+    const float du = as_float(intel_sub_group_block_read(whu + (size_t)g * SG));
+#pragma unroll
+    for (int t = 0; t < XW_TG; ++t) {
+      const int8 xg = xacc[t][c], xu = xacc[t][c + XW_NCO];
+      const int ig[8] = {xg.s0, xg.s1, xg.s2, xg.s3, xg.s4, xg.s5, xg.s6, xg.s7};
+      const int iu[8] = {xu.s0, xu.s1, xu.s2, xu.s3, xu.s4, xu.s5, xu.s6, xu.s7};
+#if defined(XW_2D_C) && defined(X2D)
+      const int2 at = (int2)(c_off + g * SG, m0 + 8 * t);
+      uint out[8];
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        const int m = 8 * t + r;
+        const float a = BCAST(av[m / 16], m % 16);
+        const float gt = a * dg * (float)ig[r];
+        float v = a * du * (float)iu[r];
+        v *= gt / (1.0f + exp(-gt));
+        out[r] = as_uint(v);
+      }
+      intel_sub_group_2d_block_write_32b_8r16x1c((__global void*)C, ldc * 4, M, ldc * 4, at, out);
+#else
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        const int m = 8 * t + r;
+        const float a = BCAST(av[m / 16], m % 16);
+        const float gt = a * dg * (float)ig[r];
+        float v = a * du * (float)iu[r];
+        v *= gt / (1.0f + exp(-gt));
+        intel_sub_group_block_write((__global uint*)(C + c_off + (size_t)(m0 + m) * ldc + g * SG), as_uint(v));
+      }
+#endif
+    }
+  }
+  return;
+#endif
 #pragma unroll
   for (int c = 0; c < XW_NC; ++c) {
     const int g = g0 + c;

@@ -1,5 +1,1143 @@
 # Changelog
 
+## 2026-11-21: model downloads resume correctly after a cut
+
+- **A cut download could grow past its size and start over from nothing** (`scripts\hf-get.ps1`, the Linux
+  launcher's downloads). A 16.67 GB file grew to 17.8 GB after a connection reset and was downloaded again in full.
+  Two causes, both fixed:
+  - curl's own `--retry` with `-C -` resumed from the offset it found at its start, so bytes were written twice. The
+    scripts now make the tries themselves: up to 6, each resuming from the `.part` file's length measured just before.
+  - Two downloads of the same file at once (two windows, or the launcher and a script) appended to one `.part`. Now a
+    lock file (`<file>.part.lock`, `flock` on Linux) refuses the second one with a message.
+- Checked with a forced cut: curl killed mid-file at a limited rate. The same run resumed, the file's SHA-256 matched,
+  and a second run started at the same time was refused. Checked in Windows PowerShell 5.1, PowerShell 7 and bash.
+
+## 2026-11-21: the B60's own defaults (prompt +4-6 %, generation +2-3 %), and the sweep's verdict
+
+- **A Pro B60, B580 or B50 (the B60's die) now has its own prompt GEMM tile:** 64 x 32 with 8 column sub-groups a
+  work-group, prefetching 1 chunk ahead. A B60's 27B prompt: 512 / 4K / 32K tokens 1,109.9 / 1,872.5 / 1,619.3 ->
+  1,171.8 / 1,954.2 / 1,680.0 tok/s, the same logits (skipzx-lab, #57).
+- **Its generation** picks the one-token GEMVs' rows by type again, not by the GPU's thread count (the B70's rule):
+  +3.5 % and +2.4 % on two B60s (23.29 -> 24.10, 23.36 -> 23.91 tok/s), the same logits (skipzx-lab #57, MaineTim
+  #19).
+- The B70, the B65 and every other GPU keep their defaults: the engine tells the B60's die apart by its PCI device
+  ID (BMG-G21, 0xE200-0xE21F). Release .21.17 went by the thread count, which also caught a Pro B65 (the B70's die
+  with 160 EUs); .21.18 corrects that.
+- **`bench/gpu_sweep` phase X named the wrong winner:** a form had to beat the best one so far by 2 %, so a later,
+  faster form was not named (on skipzx-lab's B60 it named x1 while x4 was faster at all three contexts). Now the bar
+  is 2 % over the defaults, and the fastest form past it wins.
+- **`--mtp` on a model file without the MTP block** now says so at load, instead of decoding plainly in silence.
+  Unsloth's Qwen3.6-35B-A3B-UD-Q4_K_M.gguf has none; a B390 owner saw `--mtp` run at plain speed with no MTP line
+  (#75).
+
+## 2026-11-21: the layer split in the server (`serverz --gpus N --split layer`)
+
+- **`serverz --gpus N --split layer`** (and `--tensor-split a,b,...`) serves a model split by layers, as runz runs
+  it. The server's text chat works on it as on the tensor split: prompts, generation, `--slots` with their batched
+  steps.
+  - `--ctx auto` sizes every GPU's stage on that GPU and takes the smallest context that all of them fit.
+  - The server drives the last stage, and each call that changes a conversation runs on the earlier stages first.
+- **The GPUs' order changed, in runz too:** GPU 0 now holds the last layers and the head, and GPU 1 the first layers
+  (the server's threads work on GPU 0). `--tensor-split` shares are in GPU order, so the first share is GPU 0's (the
+  last layers).
+- A split that fails to load (not a Qwen dense model, not enough memory) loads on one GPU instead, as the tensor split
+  does. A GPU failing in the middle of a call leaves the split broken until the server restarts, and `/health` says so.
+- The launchers, `zero-server -Opt split_layer` and Docker's `OPTIONS=split_layer` get it as the option "Multi-GPU by
+  layers".
+- The same answers as one GPU: under `ARC_TP_SIM`, the 4B's answers to two prompts were the same text for 2 and 3
+  stages, one at a time and two at once (batched steps), and runz's logits stayed byte for byte one GPU's.
+- The options catalog now marks a value the user gives in angle brackets (`budget`: `<GiB>`). A word there is the
+  value that turns the option on (`split_layer`: `layer`). Before, any word read as "needs a value", so `-Opt
+  split_layer` would have been refused.
+- Not yet: saved prompts and sessions (off with either split), images, `--mtp`, MoE models.
+
+## 2026-11-21: split a model over GPUs by layers (`--split layer`, runz, first form)
+
+- **`runz --gpus N --split layer`** gives each GPU whole layers instead of a part of every layer. GPU 0 embeds the
+  token and runs its layers, then hands its rows on to the next GPU; the last GPU runs the norm and the head. There
+  are no sums after every layer.
+  - It's for slow links, mixed cards, and models one card can't hold.
+  - For a single request it isn't faster than one card: a token visits the GPUs in turn.
+  - `--split tensor`, the split by matrices with sums per layer, stays the default and the fast form on matching,
+    well-linked cards.
+- `--tensor-split a,b,...` sets each GPU's share of the layers.
+- The same logits bit for bit as one GPU: checked under `ARC_TP_SIM` byte for byte, with the 4B and the 27B, 2 and 3
+  stages, short and long prompts, and both prompt paths.
+- First form: runz only, Qwen's dense models, no `--mtp`. The hand-off goes through host memory. The server, MoE
+  models, drafting and GPU-to-GPU copies are next.
+
+## 2026-11-21: the full GEMM sweep for 16-lane GPUs (B-series, Lunar Lake, Panther Lake)
+
+- **`xw_peak --all` now sweeps the 16-lane prompt GEMM too** (`gemm_xw`, which B-series cards, the 140V, the B390 and
+  a Max run). It picks the GPU's own kernel, and `--lanes 16` asks for it.
+  - The forms: tiles of 16 / 32 / 64 tokens by 16-128 columns, 1 / 2 / 4 / 8 column sub-groups, with and without the
+    lock.
+  - Where the GPU has 2D block loads, each 2D form too: the loads only, the loads and C, and the loads and C rounded
+    apart.
+  - Every form is checked bit for bit against the plain kernel, in the same stages as the 8-lane sweep.
+- `bench/gpu_sweep` phase X runs it on 16-lane cards, where it was skipped; its winners go into the model as the
+  engine's own switches.
+- Checked on the laptop with the DPAS emulated: all 44 forms that build without a spill gave the plain kernel's
+  results bit for bit (gate, up + SwiGLU, a split-K down). The 8-lane sweep is unchanged. Speed needs a 16-lane card.
+
+## 2026-11-21: the context a "does not fit" warning suggests now fits the first time
+
+- **Fix (issue #45):** following the warning's `--ctx N fits` on a 16 GB A770 took three steps with `--mtp` (92,752 ->
+  73,728 -> 56,320 -> 53,248) and two without.
+  - On a discrete card, a context too big for the card makes the engine keep some of the weights in host memory
+    (read over PCIe), so the GPU's total falls by much less than the context does.
+  - The suggestion now counts those weights too: it's the largest context with every weight on the GPU, where
+    nothing goes to host memory. The warning also says how much of the weights is in host memory.
+  - runz and the server alike. Unchanged where no weights are in host memory (the laptop: the same 55,296).
+- `ARC_FIT_PARTS=1` (runz): the memory count the check reads, by part.
+
+## 2026-11-21: faster drafting for English and code (opt-in)
+
+- **`ARC_MTP_VOCAB=32768`** (catalog option `mtp_vocab`): with `--mtp`, each drafted token reads only the 32,768 most
+  common tokens' rows of the output head instead of all 248,320. The model still checks every draft against the full
+  vocabulary, so the text is exactly the plain run's. A token outside the list is just never drafted. The idea is
+  from FR-Spec (Zhao et al., ACL 2025); no code is taken.
+  - On the laptop: the 4B on a coding prompt 36-37 -> 44-46 tok/s (+21-23 %), the 27B 10.9 -> 12.6 (+15 %),
+    Indonesian +5 %.
+  - **Chinese drafts less well: 31.6 -> 26.7 tok/s.** That's why it stays off by default.
+  - It needs 69 MB more GPU memory on the 4B, more for a wider model.
+- The token list (`scripts/draft-vocab/vocab-248320.txt`, for Qwen3.5 / 3.6 / 3.8) is ranked over this repository's
+  files and the model's own answers in Indonesian, Chinese and Spanish. `tools/make_draft_vocab.ps1` makes it again.
+- `bench/gpu_sweep.ps1` (Windows) lost its G, P, C and M tables and then stopped at phase K with "The specified
+  wildcard character pattern is not valid" (manoreken2's B60, #4): the functions' printed tables went into the
+  variables that were meant to hold their results. Fixed; the bash sweep was right.
+
+## 2026-11-21: H8 in two passes, for exact prompts (opt-in)
+
+- **`ARC_H8_Q2=1`** (catalog option `h8_q2`; `zero-server -Opt h8_q2`, `./zero-launcher.sh --opt h8_q2`): H8 reads
+  a prompt in two int8 passes instead of one. The first pass's rounding error is quantized and multiplied through
+  the same weights, then added.
+  - H8's own rounding doubled the KL against f32 on every GPU where it runs. With the second pass it's back at the
+    plain path's level: the laptop's 27B over 480 tokens, KL 0.00112 -> 0.00061 (plain 0.00056), and the same top
+    token as f32 at 474 of 480 positions instead of 467.
+  - The cost: the H8 GEMMs take about twice as long. On the laptop, whose GEMMs are most of the prompt, the 4K prompt
+    goes from 115-120 to 62.5 tok/s. It also needs a second activation buffer as large as the first.
+  - It's for work that needs the exact answer; the default stays as it was, byte for byte.
+
+## 2026-11-21: after an update into a new folder, the launcher offers to point the shortcut and PATH there
+
+- When inferzero is unpacked into a new folder, the desktop shortcut and the PATH entry (for `zero-server` in a
+  terminal) still opened the old folder. Now the Windows launcher notices this when its window opens, and asks once
+  whether to point them to the folder it runs from. A "No" is remembered for that folder.
+- The launcher review's other high findings were checked against the code: the window fits the screen's work area,
+  the labels are plain words, the network option warns and shows the LAN address, serverz's default port is 8090,
+  `serverz --help` is short (with `--help all`), and zero-server lists every model. Still open: downloads in the
+  main window instead of a dialog.
+
+## 2026-11-21: the speed and accuracy options in Docker
+
+- **`OPTIONS` in `docker/compose.yaml` and `docker/kubernetes.yaml`** chooses the options of `docs/options.md` for the
+  container. It's a comma or space list: `copy_draft` turns one on, `xcpu=off` turns one off, `budget=12` gives one a
+  value. Exactly these apply at each start, starting from the defaults; nothing is kept in the data volume, so an
+  option removed from the list is off again at the next start.
+- The entrypoint passes them to the launcher's new `--no-saved-options` (only the options given, nothing saved), and
+  serverz's log names them.
+
+## 2026-11-21: the server's log names the options in effect
+
+- At start, serverz writes one line naming the speed and accuracy options in effect, by their titles:
+  `options: CPU experts: off; Resident weights (3); Copy drafting; Kernels sent in lists`, or `none (the defaults)`.
+  - It names any option set, however it was chosen: either launcher, `zero-server -Opt`, Docker, or by hand.
+  - The catalog (`scripts/options.tsv`) is read from the package.
+  - A value the catalog doesn't name shows as `(NAME=value)`.
+
+## 2026-11-21: the speed and accuracy options in the Linux launcher
+
+- **`zero-launcher.sh` has the options** (those in `scripts/options.tsv`, as on Windows):
+  - `--options` lists each one: what it's set to now, its default, what it does, the PCs it's for, and its cost.
+  - `--opt <id>` turns one on (`--opt budget=12` for one that takes a value), `--no-opt <id>` off, and
+    `--default-opt <id>` back to the default. Each takes a comma list.
+  - `o` in the menu changes them one by one.
+- **The same choices file as zero-server on Windows** (`~/.inferzero/options.json`), kept for later starts. The
+  launcher puts each choice into serverz's environment or onto its command line, says them in words at start, and
+  `--install-service` writes them into the systemd unit.
+- Bash and the system's tools only, no jq or Python. `tests/test_launcher_options.sh` (21 cases) runs in CI. Both
+  PowerShells read the file the launcher writes.
+
+## 2026-11-21: the A770's leaner prompt GEMM loop, on by default
+
+- **`ARC_GEMM_XW_PTR` is on by default on Alchemist cards** (A770, A750, A580; `=0` turns it off). It was opt-in in
+  2026.11.21.07.
+  - skipzx-lab's A770 (#45): the 27B's 4K prompt went 1,432 -> 1,528 tok/s (+6.7 %, the same in two rounds). The
+    three FFN GEMMs are 7-14 % faster. xw_peak went from 45 % of the card's peak to 49 %.
+  - The logits are the same bit for bit on the card.
+- iGPUs (the 140T) keep it opt-in until measured.
+- The same A770's driver has no `cl_intel_subgroup_buffer_prefetch`, so DeltaNet's L1 prefetch can't run on
+  Alchemist. That isn't a build-guard bug.
+
+## 2026-11-21: 4 drafts a step on Alchemist cards
+
+- **Alchemist (A770, A750, A580) drafts 4 tokens a step by default with `--mtp`,** where it kept the 27B's 7.
+  - skipzx-lab's A770 (#45), the 27B on a coding question: plain 22.02 tok/s, 7 drafts 40.75, **4 drafts 46.08
+    (+13 %)**. 2 to 6 drafts: 42.06 / 45.56 / 46.08 / 45.11 / 43.74.
+  - Every count gave the plain run's text.
+  - The A770's verify pass costs more than a B-series card's (84 ms against a B60's 54), so later drafts pay less
+    there.
+- B-series cards keep 3, and iGPUs keep their counts. `--mtp-drafts N` still overrides.
+
+## 2026-11-21: a context too big for the GPU is reported the same way with and without drafting, by runz and the server
+
+- **The server checked nothing when `--ctx` was given by hand** (issue #45): a context past the GPU's share paged
+  without a word. skipzx-lab's 16 GB A770 ran the 27B at 92K with `--mtp` at 11 tok/s. Now it warns, as runz does:
+  how much it needs, the share, and the largest `--ctx` that fits. The context stays the one asked for. `--ctx auto`
+  already counted drafting and is unchanged.
+- **Both programs name the context that fits, counted the same way for every mode:**
+  - everything the engine holds but the context, plus the context's own bytes at that length;
+  - with `--mtp`, the MTP block, its KV rows and the draft buffers are in that count, so drafting gets a smaller
+    context than plain, never a pass.
+  - On the laptop: the 27B at 230K, plain "--ctx 219136 fits" (19.89 GiB, no warning; 1,024 more warns), with
+    `--mtp` 182,272.
+  - On an A770's share (15.11 GiB, imitated with `ARC_DRIVER_RESERVE_GB`), `--chunk 1024`: plain fits to 78,848,
+    `--mtp` to 55,296, so `--mtp` at 64K pages as well.
+
+## 2026-11-21: a leaner loop for the A770's prompt GEMM (opt-in)
+
+- `ARC_GEMM_XW_PTR=1` (Alchemist's big tile): the copy of each chunk into local memory has its addresses set once
+  before the loop, and each step adds a constant. Before, every unit rebuilt a 64-bit address from the chunk index
+  and tested whether it was real, inside a branch.
+  - The kernel-loop audit had found the GEMM's inner loop bound by issuing its own instructions: 410 for 33 DPAS on
+    an A770 (12.4 each), which caps it near 65 % of the card's peak. With the switch: 184 (5.6 each), no spill.
+  - The same bytes to the same places: the same results bit for bit. xw_peak compares it with the default, and the
+    27B's logits through the engine are byte for byte the same (the laptop, DPAS emulated).
+  - Its speed on an A770 is not measured yet: asked on #45. If it wins there, it becomes Alchemist's default.
+  - The start-up line says when it's on.
+
+## 2026-11-21: batching on one Alchemist card under Linux, as the last release meant
+
+- **Fix (issue #72):** release 2026.11.21.05 meant to send an Alchemist card's kernels in recorded lists under Linux
+  too (`ARC_BATCH=64` by default), but on one GPU it didn't: GPU 0's default was still set only under Windows, so
+  only a split model's other GPUs got it.
+  - hakangit's A750 (i915) on .21.05 with no variable: MTP 68.2 tok/s (4B) / 55.3 (9B), the same as `ARC_BATCH=0`.
+    With `ARC_BATCH=64`: 88.4 / 68.5, which is now the default. 128 gives the same (88.2 / 68.4).
+  - Every drafting run gave the plain run's tokens. Windows is unchanged: the same line, now on both.
+
+## 2026-11-21: the kernel loops counted for any GPU
+
+- `tools\kernel_isa.ps1` compiles for any Intel GPU now (`-Device dg2-g10`, `bmg-g31`, `ptl-h` ...; `mtl` as
+  before). It also counts DPAS, local-memory and 2D block messages, and with `-Loops` each loop's body, biggest first,
+  with its instructions per DPAS or DP4a.
+- What it found (docs/xe2-tuning.md section 16, the kernel-loop audit's step L2):
+  - **The A770's prompt GEMM is bound by issuing its own loop:** 410 instructions for 33 DPAS (12.4 each), which caps
+    it near 65 % of peak, as hansong80's `xw_peak --probe` measured. Each global load recomputes its 64-bit address,
+    about 20 scalar instructions. A leaner loop is the next opt-in form (QUEUE).
+  - **The B390's GEMM loop uses plain loads:** 1,323 instructions for 128 DPAS, against 317 with the 2D block loads,
+    which are on by default only on discrete cards. Asked on #1 and #74 to measure them (`ARC_GEMM_XW_2D=1`).
+  - gdn_recur's L1 prefetch is absent from the A770's offline build: its guard needs an extension that ocloc doesn't
+    define for dg2. To check on a card.
+
+## 2026-11-21: the chat template checks without Python; no .py left in the repository
+
+- `tests\test_chat_golden.ps1` replaces `tests/test_chat_render.py` and `tests/test_chat_jinja.py`. It renders the
+  same cases with `bin\chat_render.exe` and compares each rendering with a committed golden, byte for byte:
+  - the native Qwen rendering, 7 cases with and without Qwen3.8's form (14);
+  - minja on the three Gemma 4 templates in `tests\data`, 9 cases each (27).
+
+  `tests\run_tests.ps1` runs it, so it no longer skips where Python or Jinja2 is missing.
+- The goldens are what Jinja2 rendered, made without running Python: both .py checks passed on 2026-11-10, every case
+  identical, and nothing they render has changed since. The templates, `src\json.h` and minja are untouched, and the
+  two later changes to the renderer are a conversation that opens with a tool message (no case does) and an error
+  message moved to the log. The test says how to update a golden after a change.
+- Checked in Windows PowerShell 5.1 and 7: all 41 identical. A golden changed by one letter is reported, with the
+  byte where it differs.
+- With this, the repository holds no Python at all. The packages already held none.
+
+## 2026-11-21: the tiny DeepSeek-V4.1 test model made in C++
+
+- `tools\make_tiny_deepseek41.cpp` replaces `tools/make_tiny_deepseek41.py`. It writes the same keys, tensors,
+  shapes and types, with the same options (`--seed --nu --heads --real --unsloth --q5_1-down`), and each encoder
+  rounds as the .py's did. Build it with `.\build.ps1 tools\make_tiny_deepseek41.cpp`.
+  - Its random numbers come from its own generator, not NumPy's, so a seed gives other weights than the .py's did.
+  - Checked against `tools\ref_forward` (100 random tokens, mean over every position, prompt / token by token):
+    - every expert used (`--nu 16`): KL 0.0027 / 0.0028 (the .py's model: 0.0032 / 0.0033);
+    - Unsloth's types: 0.0044 / 0.0044 (0.0052 / 0.0052);
+    - Q5_1 down experts: 0.0029 / 0.0029;
+    - 4 of 16 experts: 0.055 / 0.054 (router near-ties flip experts, as before: 0.003-0.084).
+  - `--real` (4.4 GB, experts made and written one at a time) loads and generates.
+- `tools/gemma4v_ref.py` is removed: `tools\gemma4v_ref.cpp` already did all it did, and more (the 26B's
+  encoder).
+
+## 2026-11-21: the expert-cache simulators in C++
+
+- `bench\cache_sim.cpp` replaces `zero/cache_sim.py` (routes recorded with `ARC_DUMP_ROUTES`), and
+  `bench\xtrace_sim.cpp` replaces `bench/xtrace_sim.py` (traces recorded with `ARC_XTRACE`). Build them with
+  `.\build.ps1 bench\cache_sim.cpp bench\xtrace_sim.cpp`; they also build with g++ on Linux.
+  - The same policies, options and tables as the .py files. xtrace_sim breaks ties the same way. cache_sim's `lfu`
+    now picks the smallest (layer, expert) among equally used victims; the .py took whichever its hash set listed
+    first, so on ties its lfu rows could differ a little.
+  - Checked on hand-made traces whose counts were worked out by hand: every policy of both tools gives the expected
+    misses. Then on the laptop's Flash Next (256-token prompt, 48 tokens): no policy beats the engine's LRU (slru
+    +0.3 to +5.1 %, fewest uses +0.1 to +5.5 %), and Belady's bound is -42.7 %, as the earlier study found.
+
+## 2026-11-21: the prompt benchmark in PowerShell
+
+- `bench\prompt_bench.ps1` replaces `bench/prompt_bench.py`: the same request (one landing-page task on every model,
+  a fixed seed, reasoning off), the same saved answer and page, and the same summary record in
+  `bench\results\landing\summary.jsonl`, which `bench\review_data.ps1` reads.
+  - The .py could hang for good: the serverz that zero-server started in the background held its captured output
+    open. The .ps1 waits for zero-server's own process and reads its output from files.
+  - Checked in Windows PowerShell 5.1 and PowerShell 7 on the laptop's 4B (64 tokens): the same answer, tokens and
+    draft counts in both.
+
+## 2026-11-21: streamed MoE right on every GPU; Alchemist sends kernels in lists on Linux too
+
+- **Fix (issue #74):** on a Panther Lake B390 under Linux, Flash Next generated broken text while its expert cache
+  was cold: stray CJK characters, words cut in the middle (KL against f32 0.88 mean, 10 of 13 top tokens). It was
+  the race of #56: a token's missed experts read their address row while the host was still writing it.
+  - The fix of #56 (the row copied to the GPU first, `ARC_XSPLIT_TAB=1`) was the default only on Alchemist. It is
+    the default on every GPU now. With it the reporter measured KL 0.0075 and 13 of 13 top tokens, the same as with
+    no split at all.
+  - The same results bit for bit where the race didn't strike (the laptop's Flash Next, 64 tokens after a 3,584-token
+    prompt). It costs one more host wait per split layer: about 4 % of generation on the laptop, whose experts stream
+    from its SSD.
+- **Alchemist cards (A770, A750, A580) under Linux send a token's kernels in recorded lists**, as under Windows since
+  2026-11-18.
+  - An A750 with the i915 driver: the 4B's generation 46.0 -> 66.3 tok/s (128 per list: 66.6), with MTP 68.4 -> 88.5
+    (hakangit, #72).
+  - An A770 with the xe driver: no change either way (skipzx-lab, #45).
+  - The same commands in the same order, so the same results. The one-row matrix-vector rule for unbatched Alchemist
+    no longer applies there (the same sums, other rows a sub-group).
+- `AGENTS.md`: no Python anywhere in the repository; every `.ps1` works in Windows PowerShell 5.1 and 7.
+
+## 2026-11-21: every script reads text the same in Windows PowerShell 5.1 and PowerShell 7
+
+- 5.1 read a UTF-8 file without a BOM as the ANSI code page; 7 reads it as UTF-8. So a non-ASCII character in a
+  model path, a preset or a setting came out as 2-3 wrong characters under 5.1. The prompts `bench\gpu_sweep.ps1`
+  and `bench\website_bench.ps1` build from README.md and USAGE.md came out differently too.
+  - Every `Get-Content` of a text file now says `-Encoding UTF8` (59 lines in 13 scripts).
+  - Those two benchmarks' prompts are now the same in both. Under 5.1 they differ from before, so a 5.1 run from
+    before this is not comparable with one after it; 7's are unchanged.
+- `tests\test_ps_compat.ps1` (in run_tests) parses every script with both, and refuses a `Get-Content` without
+  `-Encoding`.
+
+## 2026-11-21: the launcher's speed and accuracy options
+
+- The Windows launcher's Server options card has a section "Speed and accuracy options": each option of the catalog
+  with a default / on / off choice, what it does, whether its output stays the same, what it costs, and whether it is
+  for this PC (one that is not is greyed, with the reason, not hidden).
+- Start passes the options you changed to `zero-server`, which keeps them for later starts; `-DefaultOpt <id>`
+  puts one back to its default.
+
+## 2026-11-21: zero-server turns the speed and accuracy options on and off
+
+- `zero-server start -Opt copy_draft` turns an option of the catalog on, `-NoOpt xcpu` off (an option that is on
+  by default, off). `-Opt budget=12` gives one its value; several go with commas.
+- The choices are kept for later starts (`%USERPROFILE%\.inferzero\options.json`); the command line, the dry run
+  and the start lines say which are on. A change restarts a running server.
+- `zero-server options` lists every option: its state, what it does, its cost, whether its output is the same or
+  checked, and whether it is for this PC, from the PC's graphics.
+
+## 2026-11-21: one list of the options you can turn on
+
+- `scripts/options.tsv` lists the opt-in switches people may want, ten for now, each checked against the code:
+  - what each does and its default;
+  - which PCs it is for and what it costs;
+  - whether the output stays the same;
+  - what it measured, and on whose card.
+- The launchers will read it for their options screens (next).
+- `docs/options.md` is the same list for reading, made from that file (`powershell -File tools\gen_options_md.ps1`).
+
+## 2026-11-21: expert files carry a checksum per layer
+
+- A new expert file records each layer's checksum in its header, in room the layout already keeps (marked "SUMS"):
+  the layers' bytes and offsets, and the header's version, are as before.
+- **Nothing is rebuilt**, in either direction: existing expert files load as before (they just have no sums to
+  check), and older releases load the new files as they are (the first form, a version 2 header, would have made them
+  rebuild it; caught in review before a release).
+- `ARC_EXPERTS_CHECK=1` reads a file with sums back at load and names the first layer that differs from what was
+  written. `ARC_XBUILD_VERIFY=1` does the same right after a build.
+- Tested on a small model:
+  - an old file loaded unchanged, and an older release loaded a new file unchanged;
+  - a new one has the same layer bytes;
+  - a build resumed after a stop matches one built in one go;
+  - a flipped byte is caught, with its layer named.
+- The package check (S8) now reads both files through the guarded copy, and the stall watch covers it.
+
+## 2026-11-21: a package's first part read in large pieces
+
+- Making a package (`serverz --pack`) first writes every tensor but the experts. Those were written straight out of
+  the mapped model file, so each page was read on its own as it was reached, which is slow on a USB disk and hung a
+  drive that struggles with that pattern.
+- Now each 64 MB piece is copied into a buffer while the next one is read ahead in large requests, and the copy has
+  S4's protection (a page that can't be read is read again).
+- The package is the same bit for bit: the test model's package and expert file byte-identical the old way, the new
+  way, and with read faults forced. `ARC_XBUILD_PREFETCH=0`: as before.
+- **A package is checked before it's used**: its GGUF is read back and compared with the source (its keys, its
+  tensor list, every kept tensor's bytes). One that differs is never put in place. A write gone wrong on a bad drive
+  then shows at once, not as a broken model later. `ARC_PACK_CHECK=0` skips it.
+
+## 2026-11-21: less host work per generated token; an expert file's build survives a bad read
+
+- **Each one-token matrix-vector product keeps its kernel** after its first launch. Before, every launch put together
+  the kernel's name from ~6 strings and looked it up, ~330 times a token. On Windows those allocations share one
+  lock, which a split model's GPU threads wait on. The rest of the fix for split generation (issue #4): the same
+  kernels, logits byte-identical (the 4B, the 4B over 2 simulated GPUs, the 27B, Flash Next). No change on one GPU on
+  the laptop.
+- **A page of the model that can't be read while the expert file is written** (a drive error, a file changed under
+  the build) ended the process before: Windows' in-page error, Linux's SIGBUS.
+  - Now those bytes are read again with ordinary reads, up to 3 tries. If that fails, the build stops with the file
+    and offset, and its finished layers are kept.
+  - A SIGBUS anywhere else still reaches the crash log as before.
+  - Tested: three copies made to fail on purpose, the expert file the same bit for bit; on Linux, a truncated
+    mapping's pages come back as errors.
+
+## 2026-11-21: a fix for slow generation over several GPUs (to be confirmed on 4 B60s)
+
+- Generation split over several GPUs had become no faster than one card: the 27B over 4 Pro B60s took 48.8 ms a
+  token (18.6 tok/s), against 18.4 ms in early November (issue #4).
+- The likely cause: two checks added on the path of every matrix-vector product asked the GPU driver for its
+  properties each time, ~660 driver calls a token on each GPU. They also read environment variables, which on Windows
+  take a lock all threads share. A split model's GPUs, one thread each, then waited on each other inside the driver.
+- These answers never change, so they are read once now: the GPU's kind and thread count, the GEMV's read-ahead
+  choice, and five switches read per layer.
+- The same results bit for bit (the 4B, the 4B over 2 simulated GPUs, the 27B). One GPU is not slower or faster on the
+  laptop. The 4 B60s will show whether this was all of it.
+- Expert files: a build kept after a stop (S2) now says its size and how to remove it, and the start-up names one
+  left more than 7 days (`ARC_XTMP_DAYS`).
+
+## 2026-11-21: an expert file's build goes on where it stopped
+
+- Writing a MoE model's expert file (once per model: Flash Next 52 GB, tens of minutes) began again from zero after
+  any stop. Now it goes on from the next layer, whether the stop was Ctrl+C, a stopped container, a power cut or a
+  full disk.
+  - After each layer the file is flushed to the drive, and a small `.tmp.done` file records where the next layer
+    starts.
+  - The next start takes it up only when that record and the `.tmp`'s header match this model's build exactly;
+    anything else is removed and built from zero, as before.
+- The finished file is the same bit for bit: a test model's expert file stopped after 2 of its 10 layers and finished
+  at the next start, byte-identical to one built in one go.
+- `ARC_XBUILD_RESUME=0` turns it off. (`ARC_XBUILD_TEST_STOP=N` stops a build after N layers, for tests.)
+
+## 2026-11-21: a test for Flash Next's stray words: f16 keys alone, and a counter
+
+- **`ARC_FN_KV16=1`** (a test switch): Flash Next's default mode with one part of precise mode, the attention's K / V
+  cache in f16 and its scores in f32. Everything else stays as in the default mode (one pass, the same experts).
+  It tests whether the int8 keys cause the stray words of other languages in Japanese answers (issue #4).
+  - The laptop, a 3,584-token prose prompt, 128 tokens, against precise mode: KL 0.0045 mean / 0.0178 max over the
+    first 24 tokens (the top token the same up to there), the default 0.0076 / 0.0211 over 17.
+  - Generation 5.18 -> 4.69 tok/s on the laptop. Unset, nothing changes.
+- **`bench\stray_words.ps1`** counts them in answer files, per answer and per 1,000 characters: characters of
+  scripts Japanese doesn't use (Hangul, Hebrew, Cyrillic, Greek, Arabic, Thai, Devanagari), and Latin words of 4+
+  letters inside Japanese sentences.
+
+## 2026-11-21: copy drafting (opt-in): code edits and other repeated text up to 39 % faster, the same output
+
+- **`--copy-draft`** (runz and serverz, with `--mtp`; or `ARC_COPY_DRAFT=1`): when the last 4-8 tokens appeared
+  earlier in the conversation, the tokens that followed them there become the drafts. Otherwise the MTP block drafts
+  as before.
+- The model checks every draft as it checks MTP's, so the text stays the same as without it.
+- A copied step skips the MTP block's own drafting, which is most of the gain where the answer repeats the context:
+  - a code edit (give back a function with one change), 256 tokens: the 4B 42.0 -> 58.5 tok/s, the 27B 17.5 -> 22.1;
+  - a summary, where little repeats: unchanged within the noise (the 4B 29.4 / 30.2, the 27B 9.7 / 9.3).
+- `ARC_COPY_NGRAM` / `ARC_COPY_MIN` set the longest and shortest match (default 8 / 4). Shorter matches made the
+  summary slower (2 tokens: 27 % of their drafts right).
+
+## 2026-11-21: long MoE prompts decode each matrix once (Flash Next, the 35B)
+
+- A prompt longer than a chunk goes through the model layer by layer. Each matrix is decoded into a staging slot
+  once and used for every chunk.
+- But the shared expert's gate / up / down, the router, DeltaNet's a / b and Flash Next's indexer all used one slot
+  together. They took it from each other, so they were decoded again in every chunk: in Flash Next, ~242 decodes a
+  chunk.
+- Now each has a slot of its own. On the laptop, at 4 chunks of 512, the decodes fell from 1,124 to 692. On the
+  laptop the prompt speed stays within its noise (decoding is a few % of its time); on a B70, decoding was 8-13 % of
+  Flash Next's prompt time.
+- The same results bit for bit (Flash Next, the 27B, the 4B). About 9 MB more VRAM on Flash Next; none on dense
+  models.
+
+## 2026-11-21: the whole sweep: every form of the 8-lane XMX GEMM, at every context, and it goes on after a stop
+
+- **`bin\xw_peak.exe --all`** builds every form of the A-series / 140T prompt GEMM (`gemm_xw8`) with both operands
+  packed, about 600: tiles, work-groups, the double buffer, the epilogue and local memory stages. It runs in stages:
+  - stage 0 drops the forms that spill or do not build;
+  - stage 1 times every survivor quickly on the 27B's six GEMM shapes, an untimed launch first;
+  - stage 2 times the best 10 again and checks them bit for bit;
+  - stage 3 tries the best 3 with the row order and the prefetch.
+- It shows a progress bar with the time left. Each part can be chosen (`--family`, `--tm`, `--nc`, `--wg`, `--cps`,
+  `--db`, `--epi2`, `--ms`, `--stages`, `--limit`, `--top`). `--env-out` writes each winner as the engine's switches.
+- **`bench\gpu_sweep.ps1` / `.sh`, phase X** (on by default, 8-lane XMX GPUs only) runs it, then each winner in the
+  model at each context with the logits compared.
+- **`-Contexts`** (default `512,4096,32768,max`; max is the longest of 262K / 131K / 64K that runs) also sets phase
+  C's lengths.
+- **A stopped sweep goes on where it stopped** (each finished run saved under `%USERPROFILE%\.inferzero\gpu-sweep`;
+  `-Fresh` starts again).
+- **Engine, opt-in:**
+  - `ARC_GEMM_XW_SLM_TILE` takes any TMxCOLS of 16 / 32 / 64. A shape over 64 KB of local memory is refused, and the
+    default is used.
+  - `ARC_GEMM_XW_DB=1` works on every tile.
+  - The start-up line names the big tile in use.
+- Unset, nothing changes. The new shapes give byte-identical logits (the laptop, the A770 preset emulated).
+
+## 2026-11-21: Alchemist: switches for bigger work-groups through local memory, for a sweep
+
+- The A770's big tile (32 x 32, 4 x 4 sub-groups through local memory) can now take other shapes, all opt-in, for a
+  sweep on the cards:
+  - `ARC_GEMM_XW_SLM_TILE=32x32 / 64x16 / 32x16` sets the sub-group tile;
+  - `ARC_GEMM_XW_SLM_WG="X,Y"` sets column x token sub-groups, 2, 4 or 8 each, at most 32 (8 columns is new);
+  - `ARC_GEMM_XW_SLM_CPS=1 / 2 / 4` sets how many 64-value chunks one barrier covers (`gemm_xw8 -DXS_CPS`).
+- Each prompt GEMM takes the chosen shape where it divides the matrix and the tokens, and otherwise the fallback tiles
+  as before. Unset, nothing changes.
+- On DG2 at 256 registers (ocloc), these build without a spill: 32 x 32 at 4x4 / 4x8 / 8x4, 64 x 16 at 4x4 / 8x4 /
+  8x2, and 32 x 16 at 8x4, with CPS 1. With CPS 2, only 32 x 16 8x4 (at 32 x 32 it spills 3.1-3.6 KB). xw_peak has a
+  row for each.
+- The same results bit for bit: xw_peak with the DPAS emulated, every row identical, and the laptop's 27B with the
+  A770 preset emulated, logits byte-identical in four of the shapes.
+- The XMX speed check's log line names the kernel it timed: a model in the 140T / Alchemist preset is not judged by it
+  (issue #71).
+
+## 2026-11-21: confirmed on cards: the A770's default, ARC_XCPU run to run, MTP's gain
+
+- **The A770's new default** (b443eff), skipzx-lab at 150 W with no switches: the 27B 4K prompt 1,490.5 tok/s, 16K
+  1,369.2; with `ARC_GEMM_XW_BIG=0` 1,326.0, so the big tile is +12.4 % on its own. The fallback tiles run at 128
+  tokens and the big one at 512, as the log says.
+- **ARC_XCPU** on a B60 (Flash Next, a ~4,200-token prompt then 128 tokens, each run from the same `.lru`): three
+  runs byte-identical, the same 5,691 experts on the CPU each time, 26.6-27.1 tok/s.
+- **MTP on a real prompt** (the 27B, a coding question in the chat template, 256 tokens): the A770 22.4 -> 48.6 tok/s
+  (+117 %), the B60 23.3 -> 54.3 (+133 %). On the site and in the README.
+
+## 2026-11-21: Q4_1, Q5_0 and Q8_1 models load (decoded on the CPU, kept as Q8_0)
+
+- GGUFs whose weights are Q4_1, Q5_0 or Q8_1 now load. These types have no GPU kernel here yet, so their matrices are
+  decoded on the CPU at load and kept as Q8_0, with one line in the log per type; before, loading stopped with
+  "unsupported weight type". Q8_0 has finer steps than those types, so little is lost. The conversion runs 1,024
+  rows at a time, never a whole matrix of floats in RAM (a vocab-sized output head would have been 5 GB; the
+  Researcher's review).
+- Checked on the laptop with Qwen3.5 4B, converted by llama.cpp's llama-quantize from its UD-Q4_K_XL:
+  - each against its own f32 reference, all 480 positions (corrected 2026-11-21: the first figure, 0.00188, was one
+    position): Q4_1 KL 0.00128 (max 0.0245), the same top token 473 / 480; Q5_0 0.00103 (max 0.0118), 472 / 480;
+    so the conversion to Q8_0 costs almost nothing;
+  - against the original UD-Q4_K_XL's reference: Q4_1 KL 0.042 and Q5_0 0.020, mostly llama-quantize re-quantizing
+    an already 4-bit model;
+  - a test of each decoder against the source tensor found and fixed a wrong sign in Q5_0's (correlation 0.9991
+    after);
+  - Q8_1 is converted per block too (Q8_0 takes its own scale), so it is close but not exact.
+- Q8_K, TQ1_0 and TQ2_0 are known now, so a file holding them opens; a weight of theirs still stops with a message
+  naming the type.
+- The types that loaded before are unchanged: Qwen3.5 4B and the 27B give byte-identical logits before and after.
+
+## 2026-11-21: bench/gpu_sweep waits for other GPU runs, and warms drafting with the question
+
+- `gpu_sweep.ps1` / `.sh` wait at start, up to 30 minutes, while another runz, serverz or xw_peak is running. Two
+  programs on one GPU made a whole phase's numbers wrong: on the laptop, MTP measured 2-2.5x slower than plain, when it
+  is 80 % faster.
+- The untimed warm-up of a drafting setting (`--mtp`, `--dflash`) now runs the question itself. `--bench-pp` decodes
+  plain, so MTP's verification kernels were first built inside a timed run.
+
+## 2026-11-21: Alchemist: the 27B's prompt +15.7 % (a 32 x 32 tile through local memory by default)
+
+- **Measured** by skipzx-lab (an A770 held to 150 W, Linux, issue #45, main b9f011c, the 27B IQ3_S, a 45 s pause
+  before each run). Every prompt GEMM at 32 x 32 with 4 column sub-groups, its operands through local memory with 4
+  token sub-groups a work-group, and the epilogue a row at a time:
+  - the 4K prompt 1,286.0 -> 1,488.4 tok/s (+15.7 %), 16K 1,191.6 -> 1,358.1 (+14.0 %);
+  - the GEMMs 2,168 -> 1,690 ms, every one faster, the small ones too (ssm_out 164.2 -> 114.6, o 55.0 -> 38.3);
+  - xw_peak 116.7 TOPS, 50 % of this card's measured 232, against 40 % before.
+- **Now the default on Alchemist** (A770 / A750 / A580) wherever that tile fits: both operands packed, N a multiple
+  of 128, and the tokens a multiple of 128. Elsewhere, short prompts for example, a GEMM keeps the per-shape tiles of
+  before: 32 x 32 without local memory is far slower there (548.8 tok/s in the same round). It is decided per GEMM, so
+  a split model's GPU decides for its own slice. The row-at-a-time epilogue (`ARC_GEMM_XW_EPI2`) is on by default on
+  Alchemist for every tile (+2.8 % on its own). The same results bit for bit: the laptop's 27B with the A770 preset
+  emulated, logits byte-identical at 1,024 tokens (the big tile) and at 600 (the fallback), and checked at start.
+  `ARC_GEMM_XW_BIG=0` and `ARC_GEMM_XW_EPI2=0` turn them off. The Arc 140T keeps its preset until measured.
+
+## 2026-11-21: expert-file and package builds stop when the source drive stops answering (S1); B3, B5
+
+- **A stall watchdog (S1):** writing an expert file or a package reads a whole GGUF, and some drives hang under it (a
+  D: drive did on 2026-11-19), which used to hang the build for good. Now:
+  - when no data comes from the source for 60 s, the log names the drive and advises copying the model to an internal
+    SSD;
+  - the build stops at its next check with a clear error, removes its `.tmp`, and a server stays up;
+  - only a read that never returns (3x the limit) ends the process, with exit code 4. The next start removes a
+    leftover `.tmp`, as before.
+  - Packages are written in 64 MB pieces, each counted as progress, so a slow USB disk is never taken for a hung one.
+    `ARC_XBUILD_STALL_S=N` sets the limit; 0 waits forever. Checked by a forced stall (`ARC_XBUILD_STALL_TEST=1`): the
+    error, then nothing left in the destination.
+- **B3:** the 4 alignment bytes in each layer entry of the expert file's header are now written as zeros. Before, they
+  were whatever the compiler left, so two builds could differ by them. Same size and layout: files already written
+  read as before. Checked: packing Gemma 4 26B gave an expert file byte-identical (SHA-256) to the one already there.
+- **B5:** a failed write of the expert folder's `source.txt` is now reported. Only the cleanup of orphaned folders
+  reads it.
+- B4 / S18, paths with any characters and longer than 260 on Windows, were already done: every exe embeds a UTF-8
+  code page and long-path manifest (e82fa74).
+- The start-up GEMM self-check (W3) now runs once per engine, not once per process, so each GPU of a split over unlike
+  cards is checked (the Researcher's review).
+
+## 2026-11-21: each encoder says what its GEMMs run on
+
+- The first time an image or audio encoder runs, the log says what its matrix products run on, for example `the vision
+  encoder (Qwen3-VL): int8 GEMMs, two passes, on the prompt GEMM (XMX)`, or `(DP4a)`, or `f16 GEMMs (vit_gemm_f16, no
+  XMX)`. That covers the Qwen3-VL and Gemma 4 vision encoders, the Qwen3 and Gemma 4 audio encoders, and Whisper. On a
+  card owner's log it answers whether the encoders already use the matrix engines, before work starts on putting them
+  there (QUEUE E0). Results are unchanged.
+
+## 2026-11-21: a start-up check of the GPU's matrix kernels; the launcher's button to Intel's driver page
+
+- **A start-up self-check** for a bad driver whose version looks fine: runz and serverz put a small Q8_0 matrix (64
+  x 1,024 random values) and a few tokens through the GPU's prompt GEMM, and compare with the CPU's result of the
+  same int8 values. A relative error past 1e-3, or a value that is not a number, gives the same warning as an old
+  driver: in the log, in the web UI's bar and in the launcher. It never refuses to start. It runs once per process and
+  takes a few milliseconds. The XMX kernels were already checked against this one at start, bit for bit, so this also
+  covers them. On the laptop (32.0.101.9175) the error is 1.7e-07. `ARC_SELF_CHECK=0` skips it; `=2` shows the
+  warning as if it had failed (a test).
+- **The Windows launcher** shows a bar with a button to Intel's driver page when the server reports an old driver or
+  a failed check, once per server start.
+
+## 2026-11-21: ARC_XCPU's choice of experts no longer depends on timing; guarded waits; the RAM tier rule per GPU
+
+- **ARC_XCPU** (on by default on discrete 16-lane cards) computes on the CPU the experts that are missing from the
+  GPU's cache, and copies them into the cache in the background. Which experts the CPU takes depended on two kinds of
+  timing, so a temp-0 output could differ between two runs with the same start:
+  - the background copies were committed whenever they had finished (a query at every layer). Now each one is
+    committed at a fixed point: at its layer in the next token, after waiting for it, which it has nearly always
+    finished by then;
+  - near the RAM tier's cap, the main thread and the prefetch threads raced for its last records. Now the main
+    thread takes the records for each prefetch, in order, before its thread starts, and the threads take none.
+- **Checked on the laptop** (Flash Next, ARC_XCPU forced on, a 2 GiB tier, an 8 GiB cache, 256 tokens and 64
+  generated, every run from the same saved cache state): three runs byte-identical, 116 experts on the CPU each time.
+  The code before this was also identical there (115 each): on an iGPU the copies finish too quickly for the timing to
+  show. The race was seen on B-series cards over PCIe, where it is to be confirmed. With ARC_XCPU on, the results
+  differ from before by which expert the CPU takes (one in 116 here), within the KL measured for ARC_XCPU. Without it,
+  nothing changes.
+- Note for anyone comparing runs: the expert cache saves its contents at the end of a run (the model's `.lru` file)
+  and fills from it at the next start, so two runs start from different caches unless that file is the same.
+- The waits for the background copies honour a split model's abort, as the other waits do: a GPU that fails ends
+  the run with an error instead of hanging the other GPUs (the Researcher's review).
+- The start-up fill's RAM tier rule (`ARC_XRAM_FILL`) compares against each GPU's own share of the experts on a split
+  model, not the whole file (the Researcher's review). One GPU: unchanged.
+
+## 2026-11-21: `ARC_XHIST=1`, the prompt's missing experts by tokens; `ARC_ATTN_X8=1` only where XMX passed its checks
+
+- `ARC_XHIST=1` (diagnostics): at the end of a run with streamed experts, the prompt's experts that were not in the
+  cache when their layer began, counted by how many of the chunk's tokens route to each (1, 2, 3-4, ... 129+), with
+  their GB. It is the first measurement for computing thinly routed missing experts on the CPU. It changes no result
+  (the laptop's Flash Next: logits byte-identical); there, a 256-token prompt's 5,929 misses had 1,900 experts with one token.
+- `ARC_ATTN_X8=1` on an iGPU (the Arc 140T) now needs XMX to have passed its start-time checks, as the other XMX
+  attention does: a 140T whose check failed, e.g. with an old driver, keeps `attn_q8`. Discrete cards unchanged.
+
+## 2026-11-21: help texts and docs for PRs #67 / #68; the Max defaults' switches read once
+
+- `runz --help`, `serverz --help`, docs/server.md and docs/models.md describe the borrowed MTP block for dense
+  Qwen3.5 / 3.8 fine-tunes, and say that pruned MoE models with 16 to 256 experts load.
+- The Data Center GPU Max defaults' environment checks (`ARC_GVROWS`, `ARC_GEMM_XW_PF` / `_PFD`, `ARC_GEMM_XW_WGX`,
+  `ARC_MOE_WY`) are read once, not at every GEMV / GEMM / MoE launch. The same results on every GPU (the laptop's 27B
+  at 4,096 tokens and Flash Next: logits byte-identical).
+- `ARC_GEMM_XW_SLM` and `ARC_GEMM_XW_EPI2` say at start when they are on (skipzx-lab, #45).
+
+## 2026-11-21: `ARC_GEMM_XW_EPI2` (opt-in, 8-lane XMX): the prompt GEMM's epilogue a row at a time
+
+- **Why:** skipzx-lab's A770 (issue #45, 150 W, main a5deeff) measured `ARC_GEMM_XW_SLM`.
+  - The local-memory loop lost on the 32 x 16 GEMMs: the 27B's 4K prompt 1,288 -> 1,210 tok/s at `=1`.
+  - It won only on the 16 x 32 ones at `=8` (ssm_out / o / k / v -8 to -9 %).
+  - In `xw_peak`, the 32 x 32 tile through local memory was the fastest down GEMM (7.81 against 8.38 ms) but lost
+    badly on up + SwiGLU (12.67 against 8.13). The plain 32 x 32 tile showed the same gap in the model (up 898
+    against gate 636 ms, where 32 x 16 has 551 against 489).
+  - The difference is the epilogue: a row's C was read and written in 32-byte pieces spread over the tile, and the
+    accumulate mode was decided for every value.
+- **New:** `ARC_GEMM_XW_EPI2=1`, `gemm_xw8.cl -DXW_EPI2`.
+  - A row's columns are read and written in one block message, and the SwiGLU mode is decided once.
+  - Store and add keep the add under its per-value condition. In a loop of its own, `-cl-mad-enable` fused the
+    product into the add, and split-K sums differed by an ulp (caught by `xw_peak --emu`).
+  - ocloc dg2-g10 at 256 registers, no spill: 32 x 16 with the read-ahead loop 239 -> 175 memory messages, 32 x 32
+    525 -> 269, 32 x 32 through local memory 457 -> 201.
+  - The same operations per value: bit for bit, `xw_peak --emu` on the 125H (store, SwiGLU, split-K: identical),
+    checked at start.
+- `bench/xw_peak`: `e2` variants of the default, of 32 x 32 with 2 column sub-groups and of 32 x 32 through local
+  memory. Speed to be measured on an A770.
+
+## 2026-11-21: pruned MoE models, and borrowed MTP heads for dense fine-tunes (PRs #67, #68 by triblax)
+
+- **MoE models with 16 to 256 experts** load, not only 256. A pruned model whose expert count is not a multiple of
+  16 (e.g. 184 of the 35B-A3B's 256) routes with its last lanes masked. Models whose count is a multiple of 16 run
+  the same kernels as before, token for token (Flash Next on the laptop: logits byte-identical). Flash Next keeps its
+  512.
+- **`--mtp-model` for dense Qwen3.5 / 3.8 fine-tunes** shipped without their own MTP block: the base model's GGUF
+  lends its block (e.g. a 27B fine-tune with the Qwen3.8 27B's). Drafts are verified, so the output stays the
+  fine-tune's own. A head is taken only when it matches the model: the same width, layer count, expert count, heads,
+  head sizes, FFN width and vocabulary. The last four checks were added at the merge, and a head that doesn't match
+  is refused with a message.
+
+## 2026-11-21: Data Center GPU Max (Xe-HPC): its own defaults, from hibagus's sweeps
+
+- A Data Center GPU Max (Ponte Vecchio: device IDs 0x0BD0-0x0BDB, or the name) now takes the settings hibagus's
+  one-stack Max 1550 sweep found faster (issue #48, 2026-11-20, main 03c310a). In every case the logits were the same
+  as with the defaults:
+  - the 27B's generation: one GEMV row a sub-group, as `ARC_GVROWS=1` (27.77 -> 29.70 tok/s, +6.9 %);
+  - the 27B's prompt: `ARC_H8_NORM=0`, `ARC_H8_REUSE=0`, `ARC_GEMM_XW_PF=2`, `ARC_GEMM_XW_WGX=8` (alone +5.9 / +4.6 /
+    +2.9 / +2.1 %; together 4K 2,645 -> 2,910 tok/s, +10.0 %, 16K 2,129 -> 2,306, +8.3 %);
+  - the 35B-A3B's generation: `ARC_MOE_GR_GU=4`, `ARC_MOE_GR_DN=8` (81.6 -> 88.0 tok/s, +7.9 %);
+  - the 35B-A3B's prompt: `ARC_MOE_GRF=256`, `ARC_MOE_CG=4` (4K 4,665 -> 5,138 tok/s, +10.1 %; 16K 3,994 -> 4,348).
+- Each of these set by hand decides as before. Other GPUs are unchanged: the laptop's 27B at 4,096 tokens gives the
+  same logits byte for byte. Each GPU of a split model decides for its own. Two of the pairs were measured together
+  only with a value next to these (the combined 27B prompt run with `ARC_GEMM_XW_PFD=8`, the 35B prompt with
+  `ARC_MOE_CG=8`), so a clean run on the new defaults is asked for.
+
+## 2026-11-21: build.sh builds bench/xw_peak (`./build.sh xw_peak`)
+
+- The 8-lane XMX GEMM probe now builds on Linux too, so Alchemist owners there can measure `ARC_GEMM_XW_SLM`'s
+  variants in a minute. It is not in the default list: `./build.sh` builds what it built before.
+
+## 2026-11-21: `ARC_GEMM_XW_SLM` (opt-in, 8-lane XMX): the prompt GEMM's operands through local memory
+
+- **Why:** an A770's H8 prompt GEMMs take 1.5-2x a Pro B60's (skipzx-lab, issue #45: the 27B's 4K prompt 1,289
+  against 1,866 tok/s) although it measures more int8 XMX (232 against 196 TOPS); its GEMMs run at ~28 % of that.
+  The Arc 140T's `xw_peak --probe` (issue #5) reached 85 % with the loop's operands already in L1, so they arrive
+  late. No tile, column sub-group, prefetch or lock setting closed it.
+- **New:** `ARC_GEMM_XW_SLM=1` (or `=2` / `=4` / `=8`: token sub-groups a work-group, `=1` means 4).
+  - `gemm_xw8.cl -DXW_SLM`: all a work-group's sub-groups copy its packed chunk (A and B) into local memory together,
+    one block read each, and double-buffer it, so the next chunk's reads go out before this chunk's DPAS. Every byte
+    is read from L2 once a work-group instead of once a sub-group.
+  - Only where both operands are packed (the Alchemist / 140T preset) and the token tiles divide; elsewhere the
+    kernel as before.
+  - The same integer sums in the same order: bit for bit. Checked at start (a new check shape that runs it), and with
+    `xw_peak --emu` on the 125H (store, fused SwiGLU and split-K shapes: identical).
+  - ocloc dg2-g10 at 256 registers, 32 x 16 tiles with 4 x 4 sub-groups: no spill, 24 KB of local memory, 249
+    memory messages against 299 for the default; 32 x 32 with 4 x 4: no spill, 32 KB.
+- `bench/xw_peak`: the engine's Alchemist default (`A770 32x16 w4 DB`) and three `slm` variants, to measure on an
+  A770 in a minute. Speed to be measured (asked on #45).
+
+## 2026-11-21: streamed MoE in a server: later prompts up to 44 % faster (the start-up fill out of the RAM tier by default)
+
+- **Measured** by teodortomas (a Pro B65 32 GB, Linux, issue #47, main 8c02980): Flash Next IQ3_S (52 GB of experts),
+  a 26.4 GiB RAM tier, serverz, three 3.4K-token prompts in a row:
+  - fill in the tier: 22.83 / 22.01 / 20.62 s;
+  - with `ARC_XRAM_FILL=0`: 27.0 / 13.0 / 11.5 s, so the second and third prompts are 41 / 44 % faster.
+  - With it, the SSD reads 13 GB a later request instead of 26-28, the tier serves ~12,000 records a request against
+    ~6,000, and the generation's cache hits went from 80-83 % to 89-90 %.
+  - The first request (27.0 s) was on a fresh build; that run's kernels were built during it.
+- **Now the default** where the RAM tier and the GPU's expert cache together cannot hold every expert: the cache's
+  fill at start goes to the GPU only, and the tier fills with what the cache does not hold. Elsewhere, including any
+  GPU without a tier (iGPUs), nothing changes. The same results bit for bit (the laptop's Flash Next with a 2 GiB tier
+  forced: logits byte-identical with the fill in the tier, out of it, and at the default). `ARC_XRAM_FILL=1` puts the
+  fill in the tier as before, `=0` never.
+
+## 2026-11-21: `ARC_XRAM_FILL=0` (opt-in): the expert cache's fill at start kept out of the RAM tier
+
+- **Why:** on a B65 (teodortomas, issue #47) the second and later 3.4K-token Flash Next prompts in one serverz still
+  read 26-28 GB from the SSD each (19.7-21.0 s). A request touched ~17,300 experts that were not in the GPU's cache
+  when used; the 25.3 GiB RAM tier holds ~10,400 of the 2.44 MB records. If the tier held none of what the GPU cache
+  holds, ~6,900 would be left for the SSD (~17 GB), but ~11,500 were read. The tier keeps the first records read and
+  never replaces any, and the GPU cache's fill at start went into it too, so part of it held copies of what the cache
+  already had.
+- **New:** with `ARC_XRAM_FILL=0` that fill goes to the GPU cache only, and the tier fills with the records read
+  later. The same data either way: the same results (the laptop's Flash Next with a 2 GiB tier forced, 256 tokens
+  and 8 generated: logits byte-identical). Speed to be measured on a discrete card; the most it can save is the
+  ~11 GB above, ~4-5 s of a 21 s prompt.
+
+## 2026-11-21: self audit: an attention kernel's guard, split models' GEMM tiles, help texts
+
+- **attn_split** (the long-prompt attention over key splits) builds only where its work-group divides the K / V tile,
+  as attn_q8 does. The `#error` that kept bad sizes out was dropped for issue #70, so a build with such sizes would
+  have loaded only part of each tile, with no error. No model shipped today has such sizes (head dims 64-512 all
+  divide), so nothing changed for them: the same kernels as before where the sizes fit.
+- **Alchemist's tile per GEMM shape** is no longer the default on split models. A shard's GEMMs are sliced while the
+  rule's n_embd is not, so with 3 or 4 A770s the 27B's gate / up / down took the 16 x 32 tile that was measured
+  slower for them on one card. Split models go back to the one tile they had before 2026-11-20 (the same results;
+  `ARC_GEMM_XW_SHAPE=1` still turns it on).
+- **ARC_XCPU's default** is decided once per engine, not with a driver call on every MoE layer of every token.
+  The help texts now say where it is on: any discrete GPU without 8-lane sub-groups, a Data Center Max included. They
+  also say that results move run to run with it on, so bit-for-bit checks set `ARC_XCPU=0`.
+- `serverz --help` lists the discrete defaults `runz --help` already did (`ARC_GEMM_XW_GU`, `_SHAPE`, `_DB`). Stale
+  comments that still called these switches opt-in are fixed. The docs now say that `ARC_GEMM_XW_NC_E=2` turns the
+  per-shape tiles off. serverz's new expert line logs each of its lines with the log's prefix.
+
+## 2026-11-21: serverz logs each request's expert reads (streamed MoE)
+
+- After each request of a model whose experts stream from the SSD, serverz logs runz's expert line: hits and misses,
+  the GB read from the SSD and how fast, and the RAM tier's size and the records taken from it. The numbers count from
+  the server's start, so a request's own reads are the difference to the line before. Asked for by issue #47: on a
+  B65, later prompts in one server were barely faster than the first (21.6 / 20.7 / 19.9 s), and serverz printed
+  nothing that showed why.
+
+## 2026-11-21: Alchemist: `ARC_GEMM_XW_DB=2` (opt-in), the read-ahead loop unrolled for every tile
+
+- **Why:** with the reads one step ahead (`=1`, the default on the 32 x 16 tiles), hansong80's A770 (#45) lost on
+  the 16 x 32 GEMMs (ssm_out / o +137-139 %). ocloc (2026.1, dg2-g10, 256 registers) shows no register spill in that
+  loop at either tile. What changed is the unrolling: the plain loop is unrolled over 4 chunks (65 DPAS in the
+  binary), the read-ahead loop is not (18). Unrolling it as it stands spills (16 x 32: 5,952 bytes at 2 chunks, 5,696
+  at 4).
+- **New:** `=2` reads the next chunk's weights into the same registers, a column group's right after its last DPAS of
+  the chunk, so the loop unrolls over 4 chunks without a spill (76 DPAS at 16 x 32, 72 at 32 x 16). It is on every
+  tile, 16 x 32 included. The same DPAS in the same order: the same results bit for bit (the laptop's 27B with the
+  A770 preset emulated, 1,024 tokens: logits byte-identical for `=0`, `=1` and `=2`). The default is unchanged; its
+  speed is to be measured on an A770.
+
+## 2026-11-21: Alchemist: the 32 x 16 prompt GEMMs read one step ahead by default (`ARC_GEMM_XW_DB`)
+
+- **Measured** by hansong80 (an A770 16 GB, issue #45, main 2a78721, the 27B's 4K prompt, two rounds): with the reads
+  one step ahead, every GEMM on the 32 x 16 tile got faster (down 646.9 -> 583.0 ms, -10 %; qkv / z -8 %; q -7 %; up
+  -6 %; gate -4 %), and every one on the per-shape 16 x 32 tile slower (ssm_out 169.7 -> 405.2 ms, o 55.3 -> 131.0,
+  k / v +72-82 %): -4.9 % in all with it on every tile.
+- **Now:** only the 32-token tiles take it, and on Alchemist that is the default; the 16 x 32 tiles keep the plain
+  loop. From the gains above, about 150 ms of a 3.56 s prompt (+4 %), to be confirmed on the whole prompt. The same
+  results bit for bit (checked at start; the laptop's 27B with the preset emulated: byte-identical logits).
+  `ARC_GEMM_XW_DB=0` turns it off; `=1` turns it on for 32-token tiles on any 8-lane GPU (the 140T included).
+
+## 2026-11-20: a fix for B-series cards and Lunar / Panther Lake: an image no longer ends the server (issue #70)
+
+- **What happened:** on a GPU with 16-lane sub-groups (the B-series, the 140V / B390) the first chat request with an
+  image ended serverz: building the Qwen3-VL vision encoder's attention kernel failed on an `#error` in another kernel.
+  The ops kernels build each kernel together with the parts before it, so the vision kernel's build also compiled
+  `attn_q8` with the vision heads' size (72) and a work-group that does not divide its tile (kemnitzs, a Pro B70).
+- **The fix:** `attn_q8` is compiled only where its work-group divides the tile; in a build for another kernel it is
+  left out. The text path is unchanged: the 27B's logits byte for byte as before.
+- **Checked** on the laptop with the 16-lane kernels forced (`ARC_NO_SG8=1`, as a B70 takes them): before, the same
+  `#error` and the server gone; after, the 27B with its mmproj describes a test image right ("a red circle, a blue
+  square, and the black text HELLO 42") and the server stays up.
+
+## 2026-11-20: `bench/gpu_sweep.ps1` / `.sh`: one sweep for every Intel GPU, in place of eleven
+
+- Every switch a user can change, measured on one GPU with a real model: generation and the prompt one setting at a
+  time (smallest to largest), each setting's best value checked against the defaults' logits, the best combination
+  built greedily (only each setting's best value, kept when faster), drafting (MTP 2-7, DFlash2, texts against plain),
+  the XMX tile per GEMM kind, where the time goes by kernel, and the MoE settings with `ARC_XCPU`. An untimed warm-up
+  the first time a model meets a set of switches, so no timed run includes a kernel build; progress on the console.
+- Removed: gemm_sweep, b60_sweep (2), decode_try (2), xw_sweep, xw_pergemm (2), xehpc_sweep, igpu_sweep, igpu_grf_sweep
+  (`f33_sweep` stays for the chunked DeltaNet's KL checks). Their results stay in the docs and issues.
+
+## 2026-11-20: Alchemist / Arc 140T: the prompt GEMM's loads one step ahead, opt-in (`ARC_GEMM_XW_DB=1`)
+
+- **Why:** the user asked for the A770's slow GEMMs to reach the ratio its other kernels already have against a B60
+  (1.15-1.25x, against 1.5-2x for the H8 GEMMs). In gemm_xw8's packed loop every read is waited on right where it is
+  used: a token group's activations just before its DPAS, a chunk's weights at the chunk's start. With 256 registers
+  an Xe-core runs half its threads, so little else covers that wait.
+- **What:** `ARC_GEMM_XW_DB=1` (gemm_xw8.cl -DXW_DB, where both operands are packed): the next token group's
+  activations are read before this group's DPAS, and at a chunk's last group the next chunk's weights too. The same
+  DPAS in the same order, so the same results bit for bit (checked at start; the laptop's 27B, the preset emulated:
+  byte-identical logits). ocloc dg2 at 32 x 16 WGX 4 / 16 x 32 WGX 2: no spills, no reads left between the loop's DPAS.
+- **Opt-in** until an A770 / 140T measures it; it is the first of three steps toward that ratio (next: the down GEMM's
+  split-K pieces in one launch, then the 128-register form if the registers allow).
+
+## 2026-11-20: Alchemist: a tile per prompt GEMM by default; Flash Next keeps 4,096-token chunks on split models
+
+- **A tile per GEMM shape on Alchemist (A770 / A750 / A580):** `bench/xw_pergemm` on two A770s 16 GB (issue #45:
+  skipzx-lab at 150 W, hansong80 at 225 W; the 27B IQ3_S at 4K and 16K) gave the same split: 32 x 16 with 4 column
+  sub-groups a work-group for the big GEMMs (down, up, gate, qkv, q, z: 1-9 % faster each), 16 x 32 for those with
+  N <= n_embd and K <= 8,192 (ssm_out, o, k, v: 7-27 % faster). The GEMMs' time with each at its best: -3.5 to -6.6 %
+  against the one default tile. The same sums in each column: checked at start (with a long-K shape for the big
+  tile), and the laptop's 27B gives byte-identical logits with the preset emulated. `ARC_GEMM_XW_SHAPE=0` keeps one
+  tile; setting `ARC_GEMM_XW_TM` / `_NC` / `_WGX` does too. The Arc 140T keeps its preset's tile until measured.
+- **Flash Next on a split model keeps 4,096-token prompt chunks on any card:** on two A770s 16 GB (hansong80, #45,
+  .20.03) 2,048 against 4,096 gave the prompt 466 against 527 tok/s and generation 12.2-12.8 against 13.1-13.4. A chunk's
+  sums go across the split (192 at 2,048, 96 at 4,096), so the smaller chunk pays them twice; one 16 GB card keeps
+  2,048 (14-19 % faster generation there).
+
+## 2026-11-20: bench/xw_pergemm.ps1 / .sh: which XMX tile each of a model's prompt GEMMs wants
+
+- For every tile setting, the real model's prompt (`runz --bench-pp N --n 0 --prof`) and each GEMM kind's GPU time
+  (gemm_down / up / gate / qkv / o / ssm_out / z ...): two rounds in alternating order after an untimed warm-up, the
+  fastest setting per GEMM, and the total if each GEMM took its own. 8-lane XMX (Alchemist, the 140T): 32 x 16, 32 x 32,
+  16 x 32, WGX 4, and with all settings 16 x 64, 64 x 16, WGX 1, 32 x 32 WGX 4; 16-lane (B-series): 32 x 64, 32 x 32,
+  32 x 96, 32 x 128, and 16 x 128, 64 x 64, WGX 1 / 2. Every setting gives the same results (checked at start). It decides
+  whether the engine should pick the tile per GEMM (`ARC_GEMM_XW_NC_E` does it for the n_embd-wide ones by hand).
+
+## 2026-11-20: Alchemist / Arc 140T: wider tiles for the n_embd-wide H8 GEMMs, opt-in (`ARC_GEMM_XW_NC_E=2`)
+
+- **Why:** skipzx-lab's A770 profile (issue #45) has every H8 GEMM 1.5-2x a B60's although the A770 measures more int8
+  XMX, and the three whose N is n_embd (down, o, ssm_out: K up to 17,408 against N 5,120) the most, ~2x. At gemm_xw8's
+  32 x 16 tile each activation chunk serves 16 columns, so a long K's activations are read again for every 16 (the
+  B-series' 32 x 64 serves 64). ocloc for dg2 (the A770): gemm_xw8 32 x 16 has 303 sends for 68 DPAS and 80 syncs
+  between its first and last DPAS, against gemm_xw 32 x 64 on bmg's 93 sends for 128 DPAS and 30 syncs.
+- **What:** `ARC_GEMM_XW_NC_E=2` runs those n_embd-wide GEMMs at 32 x 32 (two column groups a sub-group) and leaves the
+  others at 32 x 16. Each column's sum is the same: checked at start with an n_embd-wide shape, and the laptop (the
+  preset emulated, a 1,024-token prompt of the 27B) gives byte-identical logits with and without it.
+- **Opt-in** until an A770 / 140T measures it; skipzx-lab's sweep set one tile for every GEMM (32 x 32 for all:
+  1,004 tok/s against 1,217), which would hide a win on these three alone.
+
+## 2026-11-20: the CPU computes MoE experts missing from the GPU cache by default on B-series cards (`ARC_XCPU`)
+
+- **Why:** a Pro B60 on PCIe 3.0 x8 (skipzx-lab, issue #57, a62be02), Flash Next IQ3_S, a ~4,200-token prompt then 256
+  tokens, three pairs: 22.66 / 22.59 / 22.25 tok/s off against 26.33 / 26.34 / 26.11 on (+17 %), ~13,340 experts on
+  the CPU at 0.10-0.11 ms each. The user: make it the default.
+- **Where:** discrete Battlemage cards (the B-series: B580, Pro B50 / B60 / B65 / B70). Not on Alchemist (an A770 on
+  PCIe 3.0 x16 measured no gain, 20.0 / 20.6 -> 18.9 / 20.1) and not on iGPUs (they read RAM directly). `ARC_XCPU=0`
+  turns it off, `=1` on, anywhere. Split models only with the test switch, as before.
+- **What changes in the answers:** the CPU's sums are not the GPU's bit for bit (KL-checked: over 708 positions the
+  top token 701 -> 695, 98.2 %; skipzx-lab's generation 241 -> 237 / 256), and which experts the CPU takes follows the
+  background fills' timing, so a temp-0 answer can differ slightly between runs until the fills are committed at fixed
+  points (queued). `ARC_XCPU=0` gives the reproducible path.
+- **A timing trap:** `--bench-pp N --n 128` in the default mode showed it slower on the B60 (early stalls of
+  190-340 ms a step); a real prompt then generation is the measure. With the GGUF on a USB disk the gain fell to ~10 %.
+
+## 2026-11-20: Flash Next's 4,096-token prompt chunks from 20 GiB on discrete cards (16 GB cards keep 2,048)
+
+- **Why:** on a 16 GB A770 (skipzx-lab, issue #57, Linux, held to 150 W) the bigger chunk gained the prompt only
+  3-6 % (16K 517 -> 535 tok/s) and cost generation after it 12-16 % (15.1 -> 13.3 tok/s after 16K, 15.2 -> 12.8
+  after 32K), because its buffers take room from the expert cache (16 -> 14 % of the experts). On a 24 GB B60 it gained
+  the prompt 10 % for 2 % of generation. The user: "keep the faster one".
+- **What:** Flash Next takes 4,096 on discrete cards with 20 GiB or more (the B60, B65, B70) and 2,048 below (the
+  A770 / A750 16 GB, Pro B50 16 GB, B580 12 GB). iGPUs keep the 15 GiB line. `--chunk` still overrides it.
+- **Accuracy:** the same at every chunk size (skipzx-lab's KL against f32, 256 positions: the B60 0.00740 at 4,096,
+  0.00897 at 2,048; the A770 0.00774 at both).
+
+## 2026-11-20: the FFN's gate and up in one launch by default on discrete cards (`ARC_GEMM_XW_GU`)
+
+- A Pro B60 under Linux (skipzx-lab, issue #57, main a62be02): the 27B's 4K / 16K prompt 1,805.8 / 1,764.9 ->
+  1,865.9 / 1,831.6 tok/s (+3.3 / +3.8 %), the logits of a 4K code prompt byte for byte the default's. So it is the
+  default on discrete cards with 16-lane XMX (the B-series); `ARC_GEMM_XW_GU=0` turns it off. iGPUs with 16-lane XMX
+  (the 140V / B390) keep it opt-in until measured; the laptop's logits are byte for byte as before.
+- Also measured by skipzx-lab, nothing changed for it: `ARC_ATTN_X8=1` on an A770 (150 W) is slower than `attn_q8`
+  (27B 4K 1,217 -> 1,160 tok/s, 16K 1,135 -> 923; its best work-group, 1 x 1, still 1.6x attn_q8's time): it stays
+  opt-in. The A770's gemm_xw8 tile, group and prefetch sweep: nothing beats the defaults (every set bit-identical).
+
+## 2026-11-20: precise mode's CPU experts in one pass by default; the old-driver warning in the web UI and launchers; ARC_BATCH per GPU
+
+- **ARC_XCPU in `--precise`: one pass on the CPU by default** (the user's choice). With `ARC_XCPU=1` the CPU's
+  experts run one int8 pass, while the GPU's experts and everything else keep both. Measured (Flash Next, token by
+  token against f32, 548 chat + 160 code positions): KL 0.00126 / 0.00251, top token 700 / 708 (98.9 %), 0.187 ms an
+  expert. `ARC_XCPU_Q2=1` selects both passes on the CPU (A2's form: 0.00076 / 0.00222, 702 / 708, 0.302 ms). This
+  replaces the `ARC_XCPU_Q2=0` of the entry below, whose default was two passes. With ARC_XCPU unset nothing changes.
+- **Run to run:** which experts the CPU takes depends on when the background fills finish (fill_commit only polls
+  them), so ARC_XCPU's logits differ between runs of the same prompt. With one pass that shows: 6 runs of the code
+  tokens KL 0.00168-0.00519 (top token 157-158 / 160), 3 of the chat 0.00084-0.00152 (540-543 / 548); the worst
+  pair 697 / 708 = 98.4 %, all far under precise's 0.015. Two passes stay at 0.00222-0.00224 (158 / 160).
+- **The old-driver warning, shown (W2):** serverz's `/props` carries `driver_warning` when the Intel graphics driver
+  is older than 32.0.101.8976. The web UI shows it in a bar above the chat (with a link to Intel's driver page; hidden
+  until the page is reloaded), the Windows launcher in its status line and details, `zero-server status` in yellow,
+  and `zero-server doctor` as a FAIL line (from the driver's own version, the server running or not). Windows only,
+  as the check itself; Linux reports its driver differently.
+- **ARC_BATCH per GPU (tiered placement P0):** the recorded-list default (64 on Alchemist under Windows) is now each
+  GPU's own, from its own kind, instead of GPU 0's for the whole process, so a later split over unlike cards gives each
+  card its setting. Today's splits are of one kind: nothing changes for them or for one GPU.
+
+## 2026-11-20: `ARC_XCPU_Q2=0`, precise mode with a faster CPU (opt-in); ARC_XCPU's top token over 708 positions
+
+- **`ARC_XCPU_Q2=0`** (opt-in): in Flash Next's precise mode the CPU's experts run one int8 pass, as before A2, while
+  the GPU's experts and everything else keep both. Unset, the CPU runs both passes (A2), since precise is chosen for
+  exactness. Flash Next IQ3_S, token by token against f32, the Japanese chat (548 positions) and 160 code tokens, a
+  4 GiB cache with the RAM tier:
+
+  | Precise mode | KL (chat / code) | top token | CPU, ms an expert |
+  |---|---|---|---|
+  | CPU off | 0.00075 / 0.00221 | 702 / 708 | - |
+  | CPU on, two passes (default) | 0.00076 / 0.00222 | 702 / 708 | 0.302 |
+  | CPU on, one pass (`ARC_XCPU_Q2=0`; before A2) | 0.00126 / 0.00251 | 700 / 708 | 0.187 |
+
+  All within precise's 0.015 and above 98 %. The laptop's iGPU gains no speed from ARC_XCPU (it reads RAM directly);
+  a discrete card on a slow link does (skipzx-lab's B60: Flash Next 22.5 -> 27.3-28.2), so the speed is asked there.
+- **ARC_XCPU in the default mode** over the same 708 positions: top token 701 off, 695 on (98.2 %, the rule is 98 %);
+  KL 0.00220 -> 0.00263 (chat), 0.00827 -> 0.00379 (code). Every flip is a near tie of the f32 reference (top-two
+  margins 0.0004-0.21 in log-prob). The 156 / 160 of A2's row was those 160 code tokens alone.
+- With `ARC_XCPU_Q2` unset: logits byte for byte as after A2 (precise, ARC_XCPU=0).
+
+## 2026-11-20: the FFN's gate and up GEMMs in one launch on 16-lane XMX, opt-in (`ARC_GEMM_XW_GU=1`)
+
+- **Why:** on a Pro B70 the 27B's 4K prompt takes 1,378 ms (2,962-2,972 tok/s); 3,000 needs 1,365. `gemm_up` takes
+  219 ms against `gemm_gate`'s 170 on the same shape: the gate GEMM writes its f32 result to `big_` and the up GEMM's
+  fused SwiGLU reads it back, 285 MB a layer each way (18 GB per 4K prompt).
+- **What:** `gemm_xw.cl -DXW_GU`: one launch computes both. A sub-group's first half of column groups reads the gate
+  weights, the second half the up weights of the same 32 columns, and its epilogue writes silu(gate) * up. The gate
+  value is computed as the gate GEMM stores it and the product as the fused SwiGLU computes it, so the results are the
+  same bit for bit. ocloc for a B70 (32 x 64, 2D loads and stores, prefetch, WGX 4, 256 registers): the same 128 DPAS
+  a chunk, first-to-last DPAS 285 -> 237 instructions, the kernel 4,683 -> 2,253 instructions, sends 93 -> 70, no
+  spills.
+- **Opt-in** on 16-lane XMX (discrete Battlemage, the 140V / B390); checked at start against the two launches on
+  random data, and off with a line if it differs. Without the switch nothing changes.
+- **Checked here** (the laptop, `gemm_xw`'s DPAS emulated): the 27B's 480-token prompt + 16 tokens, logits byte for
+  byte with and without it. The speed is for a B70 owner to measure (with and without resident weights).
+- **Not built:** moving part of `h8_act`'s rotation into this epilogue. In H8's stage order only the two lowest index
+  bits could move there and stay bit-identical; that is a few ms at most, less than it would add to the epilogue.
+
+## 2026-11-20: the expert cache's background fills: four races and a leak (self audit A3-A6)
+
+These are the copies `ARC_XCPU=1` queues so that a token's CPU-computed experts enter the GPU cache for the next tokens.
+- **A3:** `shrink()` (a launch that ran out of memory) could free a 1 GiB piece of the cache while a fill was still
+  copying into it, and the fill's commit then set a slot past the shortened arrays. Fills now finish and commit first.
+- **A4:** a fill could take the slot a deep prefetch was writing on its thread. No fills are queued while one runs.
+  Fills are only a head start for later tokens; the CPU computes the miss either way.
+- **A5:** the destructor left the fills' copy list and its 512 events behind at every model switch. It now waits for
+  the fills and destroys both.
+- **A6:** an error while queuing a fill left its slots outside every list and its experts marked pending. They are
+  now given back before the error goes on.
+- Checked: `ARC_XCPU=0`, Flash Next's logits byte for byte as before (64 tokens). `ARC_XCPU=1`: 128 tokens,
+  13,521 experts on the CPU and as many fills, none dropped. The out-of-memory and model-switch paths were not
+  run here.
+
+## 2026-11-20: packing and expert-file builds: a moved source, two processes, the stop guard (self audit A7-A10)
+
+- **A moved or copied source (A7):** packing a model again from its new place (copied from D: to C:, say) was
+  refused as "made from another file". Now the package's tensor table (every tensor's name, type and shape) is
+  compared with the file's: the same tensors are taken as the same model, with a line saying so; a model of the same
+  name made otherwise is still refused.
+- **Two processes building the same file (A9):** a build now holds a lock beside its `.tmp` (`plat::BuildLock`:
+  Windows opens it unshared and deleted on close, Linux uses `flock`). A second process that finds the lock held stops
+  with "another inferzero is writing ... now" instead of removing the `.tmp` the first is still writing. The line
+  about an old `.tmp` now says "removed" only when it was.
+- **The stop guard (A8):** guards are counted, so two builds on two threads restore the Ctrl+C / SIGTERM handlers in
+  the right order; a signal the process ignores (SIG_IGN) stays ignored and no longer stops a build.
+- **Docker (A10):** `compose.yaml` and `kubernetes.yaml` no longer say SIGTERM handling is "not yet".
+- Inference is untouched: no kernel or engine path changed.
+
+## 2026-11-20: ARC_XCPU in precise mode runs both passes, and works on packaged models (self audit A2)
+
+- **Precise mode (`--precise`):** the GPU's experts run two int8 passes there (the activations and their rounding
+  residual), but the CPU's experts under `ARC_XCPU=1` ran one. Now the CPU does both, as the GPU's fused kernels do:
+  gate / up against the activations and their residual, the two sums added; h quantized with its residual
+  (`quant_act32_q2`, as `moe_quant`); the down rows against both. Flash Next, 160 code tokens token by token against
+  f32: KL 0.00221 with the CPU off, 0.00222 with it computing ~10,700 experts (top token 158 / 160 both). Two passes
+  cost the CPU 0.301 ms an expert against 0.176 in the default mode.
+- **Packaged models:** a launcher package keeps the experts in its `.experts` file only, so its GGUF's expert tensors
+  have no data, and `ARC_XCPU=1` refused every such layer: it did nothing on a packaged model. The CPU only ever
+  computes experts whose record is in the RAM tier (where records stay once read), so it now reads those alone and no
+  longer needs the GGUF's copy.
+- With `ARC_XCPU=0` (the default) nothing changes: Flash Next's logits byte for byte as before, default and precise.
+
+## 2026-11-20: the prompt attention as flash attention on 8-lane XMX, opt-in (A770 / A750, Arc 140T)
+
+- **Why:** the A770's 27B 4K prompt is ~1,223 tok/s against a B60's ~1,726, and attention is 13.6 % of its 16K
+  prompt: Alchemist and the 140T ran `attn_q8` on DP4a, since `attn_fx` (Battlemage) needs 16-lane DPAS.
+- **What:** `zero/kernels/attn_x8.cl`, the 8-lane form of `attn_fx`: 8 query tokens a sub-group, 8 x 8 x 32 int8
+  DPAS, K / V straight from the int8 cache, `attn_fx`'s online softmax and P quantization per 32 keys. The scores are
+  computed transposed (keys as the DPAS rows, one token a lane), so K is read in full cache lines and the softmax needs
+  no reductions; one 8 x 8 transpose a span turns P into the A operand. Heads of 256 dims run on two sub-groups that
+  add their integer partial scores through SLM. ocloc (`dg2`, `arl-h`), the 27B's shape: no spills, 1,459 / 1,446
+  instructions and 72 memory messages per 32-key span.
+- **Opt-in:** `ARC_ATTN_X8=1` (on GPUs with 8-lane XMX), checked at start against `attn_q8` like `attn_fx`;
+  `ARC_ATTN_X8=2` emulates the DPAS with DP4a on any GPU with 8-lane sub-groups (tests). Owners of an A770 / 140T:
+  to measure (`--bench-pp 4096` / `16384` / `65536` with `--prof`).
+- **Accuracy** (the laptop, DPAS emulated), against `attn_q8`: the 27B over 4 x 512 tokens of USAGE.md KL 0.00058
+  (max 0.0128, same top token 98.53 %), one 4,096-token chunk 0.00056 (max 0.0146, 98.83 %); the 4B 0.00078
+  (max 0.0176, 98.33 %). Against f32 (the 27B, 480 positions): 0.00056 (`attn_q8`) -> 0.00060, max
+  0.0133 -> 0.0101, top token 469 -> 476 of 480.
+- Without the switch every GPU runs as before: the laptop's 4B and 27B logits bit for bit (480 tokens of USAGE.md + 16).
+
+## 2026-11-20: 4,096-token chunks for MoE models fully on the card too; the driver warning's threshold; a warm-up fix
+
+- **The 35B-A3B (and other MoE models) with every expert on the GPU: chunk 2,048 -> 4,096** (the user: "Yes, 4096
+  for all", "gemma4 2048 then"). Gemma 4 keeps 2,048. Speed and KL to be measured on a B70 / B60 (asked; the laptop
+  streams the 35B's experts, so it can't run this case): not in a release until that's back.
+- **The old-driver warning** (self audit F1): from 32.0.101.8976, the oldest driver users measured right
+  (manoreken2's B60s; a1ex4's 140V ran 8991), instead of 9033, which warned those. Checked with `ARC_TEST_DRIVER`:
+  8976 and 8991 silent, 31.0.101.5328 warns.
+- **The warm-up's 2-8-row passes** read past their token list when a context was under 20 tokens (self audit F4): the
+  list now holds at least 8.
+
+## 2026-11-20: `bench/xehpc_sweep.sh`: every kernel and tile setting swept on one GPU
+
+- For the Data Center GPU Max 1550 (issue #48), whose settings were never tuned (the defaults are the B-series ones), and any discrete card: each generation and prompt setting changed alone from the defaults, from the smallest value to the largest (prompt chunks at most 4,096), a winner at +2 %; each winner's logits then hashed against the defaults (`same`, or `differs`: a KL check before it could be a default), and a phase's winners run together at tg128 / pp512 / pp4096 / pp16384. `--moe-model` adds the MoE settings, `--quick` takes fewer values. Linux, bash only. Written by the Researcher session; not run on a GPU yet.
+
+## 2026-11-20: a warning when Windows has put an old Intel graphics driver in place
+
+- **Why:** a Windows Update put a February 2024 Intel driver (31.0.101.5328) in place of 32.0.101.9150 on the laptop.
+  On it, Flash Next's logits were wrong (KL against f32 1.5-5, against 0.0022 on 32.0.101.9175) and a run ended in a
+  device lost, with nothing to say why.
+- **What:** on Windows, runz and serverz compare the driver with 32.0.101.9033 (the oldest docs/install.md lists) and,
+  when it is older, log once: the version, that answers may be wrong, and to install Intel's current driver. They still
+  start. (`ARC_TEST_DRIVER=x.y.z.w` checks a given version, a test of the warning.) The launcher and web UI showing it,
+  and a start-up self-check of the GPU's results, are next (QUEUE).
+
+## 2026-11-20: prompt chunks of 4,096 tokens for Flash Next and the streamed MoE models
+
+- **The user's choice:** 4,096 is the prompt chunk, and the largest. Flash Next goes 2,048 -> 4,096 on GPUs with 15 GiB
+  or more (smaller cards keep 2,048); the other streamed MoE models (the 35B-A3B when its experts are streamed) 8,192 ->
+  4,096. Gemma 4 keeps 2,048, which was faster for it.
+- **Flash Next:** a Pro B70 (joshdev-de, issue #27): 4K / 16K prompt 1,150 / 1,110 -> 1,257 / 1,216 tok/s (+9 %), its
+  expert cache 23.35 -> 22.53 GiB; the laptop (driver 32.0.101.9150): 4K 156 -> 164 tok/s, generation after it 5.3 ->
+  5.8. KL against f32 on 3,584 tokens the same at both sizes (default 0.00894, precise 0.00583; driver 32.0.101.9175).
+- **The streamed 35B-A3B:** from the laptop's earlier sweep, a 32K prompt 604 -> 533 tok/s (-12 %), its expert cache
+  77 -> 81 %, generation at 128K 12.6 -> 12.8 tok/s. `--chunk 8192` gives the old speed back.
+
+## 2026-11-20: a fix for Lunar Lake / Panther Lake: wrong answers after a short follow-up with a resident model
+
+- **The bug** (self audit, A1; releases 2026.11.19.05-.07): on iGPUs with 16-lane XMX (Arc 140V, Arc B390), a
+  model whose decoded weights are kept on the GPU (a 4B, maybe a 9B) has them converted to H8's rotated form the
+  first time a prompt of 256+ tokens runs. A later chunk under the H8 threshold (a short follow-up message, a long
+  prompt's tail) then took the plain path over those rotated weights: wrong logits. Models whose weights are decoded
+  just in time (the 27B there) were not affected.
+- **The fix:** weights kept on the GPU always take H8 there, as before release .05; the threshold (`ARC_H8_MIN`)
+  applies only to weights decoded just in time. Not run on a 140V or B390 here (the laptop has no XMX); the owners
+  are asked to check a 4B with a long prompt and then a short one.
+
+## 2026-11-20: the first requests after an update don't wait for the 2-8-row kernels (one longer warm-up instead)
+
+- **What** (joshdev-de, PR #65): the warm-up also runs passes of 2 to 8 rows, which short prompts, short follow-up
+  turns and `serverz --slots` use. A Pro B70's `serverz --slots 4`, 27B, after an update: the first request 35.2 ->
+  4.0 s, the first round of 4 at once 19.3 -> 9.0 s.
+- **The cost:** the one-time warm-up after each update takes longer, 10.9 -> 85.6 s on the B70 with the driver's
+  compiler cache off (~75 s more, once); later starts skip it as before. Bit-identical: the warm-up's output is
+  thrown away.
+
+## 2026-11-20: the first answers after an update no longer wait for kernels: the warm-up covers MTP heads and switches
+
+- **An MTP head in a file of its own is warmed over every row count** (joshdev-de, PR #62). The warm-up rejected every
+  draft, so the MTP block only ever ran on one row there; Flash Next's Q8_0 head (`mtp-*.gguf`, its own matrices and
+  experts) then compiled 11 kernels in the first real answer. A Pro B70, first MTP answer after an update: Flash Next
+  5.0 -> 56.1 tok/s, the 35B-A3B 11.4 -> 131.3. Installs warm up once more after this release.
+- **A run with other `ARC_*` switches, or another MTP head, warms its own kernels** (joshdev-de, PR #63). The warm-up's
+  marker ignored them, so such a run skipped the warm-up and compiled in generation: a B70's 27B with
+  `ARC_GEMV_WAVE_MT=0`, first run 18.1 -> 64.8 tok/s. Each combination warms up once.
+- Both bit-identical: the warm-up's output is thrown away (`--dump-logits` the same before and after on the B70's
+  27B, 35B-A3B and Flash Next, and here on the 4B with and without MTP: both builds on the same driver, 31.0.101.5328,
+  which Windows Update had installed; the identity holds, the speeds of that morning don't).
+
+## 2026-11-20: Alchemist: the decoded weights kept for short prompts, beside the 140T preset (`ARC_140T_RES=1`, opt-in)
+
+- **Why:** on Alchemist the 140T preset keeps no decoded copy of the weights, so a prompt chunk under 512 tokens
+  decodes every weight first (~45-55 ms on an A770's 4B at any length).
+- **What** (skipzx-lab, PR #61): with `ARC_140T_RES=1`, where the decoded copy fits it stays for chunks under 768
+  tokens (the DP4a GEMM), and the preset still takes longer chunks from the raw weights. An A770 on Linux, best of 3:
+  the 4B's 128-token prompt 1,161 -> 2,030 tok/s, 512 2,744 -> 3,170, 4K unchanged (5,025 / 5,006); the 9B (with
+  `--budget 14`) 684 -> 1,487 at 128. Generation the same. The cost is the copy: the 4B's GPU buffers 3.9 -> 7.7 GiB,
+  the 9B's 6.6 -> 13.9, less room for the context, so it stays opt-in.
+- **Accuracy:** each chunk takes one of the two existing paths, bit for bit (17- and 640-token prompts equal to the
+  resident path, 3,584 tokens equal to the default). KL against f32 on 512 tokens goes down, as the short chunks read
+  the plain int8 weights instead of the rotated ones: the 4B 0.00197 -> 0.00102 (top token 490 -> 501 / 512).
+
+## 2026-11-20: `serverz --gpus N` says what a split model leaves out
+
+- With `--gpus 2`, `--mmproj` was accepted and then dropped without a word (`/props`: vision false; catduckgnaf,
+  issue #59). The server now logs that images are not read with a split model yet, and that drafting is off.
+
+## 2026-11-19: split models: the prompt's sums direct by themselves where the direct links are a little slower
+
+- **Measured:** hibagus's 4 stacks of Max 1550s (issue #48), the 27B, 5 rounds of the three settings: host memory
+  (the timed choice there) 512-token prompt 2,204-2,239 tok/s, generation 47.0-47.2; `ARC_TP_P2P=1` 2,666-2,688 and
+  44.8-45.1; `ARC_TP_P2P=prompt` 2,676-2,697 and 46.8-47.3: both best ones.
+- **What:** when the links' timing finds the direct path at 0.5-0.8 of host memory's speed (hibagus: 31 against 46
+  GB/s), a split model now takes `=prompt`'s split by itself: the prompt's sums straight from GPU to GPU, a generated
+  token's through host memory. At 0.8 or more both go direct, below 0.5 both through host memory, as before; the
+  load line says which. The logits are the same on every path.
+- **Confirmed on release .07** (hibagus, 5 rounds, the default against `=prompt`): the default picked the split by
+  itself every time (31.0-31.1 against 45.6-46.6 GB/s), prompt 2,670-2,686 tok/s and generation 45.9-47.2, the same
+  as `=prompt`; the two stacks of one card still go direct for both.
+
+## 2026-11-19: Lunar Lake / Panther Lake: H8 from 256 tokens, not 1,024 (a correction to release .05)
+
+- **Why:** a1ex4's crossover runs on the Arc 140V (issue #60, release .05, `--bench-pp` best of 3) put it at ~140
+  tokens: H8 / without it 128 tokens 86 / 89-93 tok/s, 256 156 / 96, 512 252 / 176, 1K 339 / 185, 4K 384 / 170. The
+  1,024 of release .05 came from one cold prompt each and made prompts of 256-1,023 tokens 1.4-1.8x slower.
+- **What:** `ARC_H8_MIN`'s default on iGPUs with 16-lane XMX is now 256: only chunks under 256 tokens skip H8.
+- **Accuracy:** on a 480-token prompt, KL against f32 0.00117 (max 0.029, the top token 470 / 480) with H8 against
+  0.00057 (473 / 480) without, both far inside 0.015; generation never runs H8. `ARC_H8_MIN=100000` keeps every
+  prompt off H8 for those who want the second.
+
+## 2026-11-19: `ARC_TP_P2P=prompt`: a split model's prompt sums direct, its generated tokens' through host memory
+
+- **Why:** on hibagus's 4 stacks of Data Center GPU Max 1550s (Xe Link between the cards, issue #48), the links'
+  timing (31 GB/s direct across cards against 46 through host memory) rightly puts generated tokens' sums in host
+  memory (a step 19.7-20.0 ms against 20.4-20.9 direct), but the prompt was 19 % faster direct (512 tokens 2,137-2,161
+  -> 2,548-2,573 tok/s): one switch chose for both.
+- **What:** `ARC_TP_P2P=prompt` sends the prompt chunks' sums (the reduce-scatter, 64 rows and more) straight from
+  GPU to GPU and keeps the one-step sums of generated tokens in host memory. Opt-in: `=1` / `=0` and the timed
+  choice are unchanged.
+- **Checked:** the laptop (`ARC_TP_SIM`, the 4B over 2): `=prompt`, `=1` and `=0` give byte for byte the same logits.
+  hibagus is asked to time it.
+
+## 2026-11-19: Lunar Lake and Panther Lake laptops: short prompts without H8 (`ARC_H8_MIN`)
+
+- **Why:** on a1ex4's Core Ultra 7 258V (Arc 140V, issue #60), the 27B on a 480-token prompt ran at 126 tok/s with
+  H8 (the Hadamard-rotated int8 prompt GEMMs) and 147 without, and H8 cost accuracy there: KL against f32 0.00117
+  (max 0.029, the top token 470 / 480, under 98 %) against 0.00057 (max 0.007, 473 / 480). A 128-token prompt spent
+  70 % of its 1.5 s decoding weights for H8. At 4K, H8 stays well ahead (444 against 324 tok/s).
+- **What:** on iGPUs with 16-lane XMX (Arc 140V, Arc B390), prompt chunks shorter than 1,024 tokens take the plain
+  XMX GEMM; longer ones keep H8. `ARC_H8_MIN=N` moves the threshold (0: H8 at every length, as before); `ARC_H8=1`
+  forces H8 everywhere. Discrete cards, the Arc 140T's preset and the 125H (no XMX) are unchanged.
+- **Checked:** not on a 140V or B390 here: the numbers above are a1ex4's runs with H8 on and off, which this
+  threshold picks between by chunk size. On the laptop's 125H nothing changes (no H8 there). The owners are asked
+  for the crossover.
+
 ## 2026-11-19: `ARC_XCPU=1` for DeepSeek-V4.1 (opt-in)
 
 - **What:** the CPU now also computes DeepSeek-V4.1's experts missing from the GPU's cache: kernels for MXFP4 (the

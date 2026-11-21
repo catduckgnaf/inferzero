@@ -96,7 +96,7 @@ $text = "<|im_start|>user`nWrite a Python module with a class LRUCache (get, put
         "<think>`n`n</think>`n`n"
 [IO.File]::WriteAllText($q, $text, (New-Object Text.UTF8Encoding $false))
 $kltext = Join-Path ([IO.Path]::GetTempPath()) "inferzero-website-kl.txt"
-[IO.File]::WriteAllText($kltext, (Get-Content (Join-Path $root "USAGE.md") -Raw).Substring(0, 2600))
+[IO.File]::WriteAllText($kltext, (Get-Content -Encoding UTF8 (Join-Path $root "USAGE.md") -Raw).Substring(0, 2600))
 
 $gpu = (& (Join-Path $root "bin\mgpu_probe.exe") 2>&1 | Select-String -Pattern "^\s+GPU 0:" | Select-Object -First 1)
 $gpu = if ($gpu) { $gpu.Line.Trim() } else { "unknown GPU" }
@@ -105,7 +105,7 @@ $gpu = if ($gpu) { $gpu.Line.Trim() } else { "unknown GPU" }
 $commit = ""
 $pre = Join-Path $root "bin\PREBUILT.txt"
 if (Test-Path -LiteralPath $pre) {
-  $mc = [regex]::Match((Get-Content -LiteralPath $pre -Raw), 'commit ([0-9a-f]+)')
+  $mc = [regex]::Match((Get-Content -Encoding UTF8 -LiteralPath $pre -Raw), 'commit ([0-9a-f]+)')
   if ($mc.Success) { $commit = $mc.Groups[1].Value }
 }
 if (-not $commit -and (Test-Path -LiteralPath (Join-Path $root ".git")) -and (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -167,7 +167,7 @@ foreach ($m in $Models) {
     $rb = Join-Path $Out "ref\$name.f32.bin"
     if (-not (Test-Path $rb)) {
       $null = Run @($m, "--text-file", $kltext, "--dump-ids", $ids)
-      $t = ((Get-Content $ids -Raw).Trim() -split ",")
+      $t = ((Get-Content -Encoding UTF8 $ids -Raw).Trim() -split ",")
       [IO.File]::WriteAllText($ids, ($t[0..([math]::Min(479, $t.Count - 1))] -join ","))
       WaitFree
       $env:REF_ALL = "1"

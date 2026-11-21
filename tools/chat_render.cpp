@@ -1,5 +1,5 @@
 // Renders a chat request with src/chat.h (Qwen, native) or with minja (--jinja template.jinja), for comparison
-// against the GGUF Jinja template rendered by jinja2.
+// against the GGUF Jinja templates' renderings by Jinja2, kept as goldens (tests/test_chat_golden.ps1).
 // usage: chat_render case.json [--jinja template.jinja]   (case: {messages, tools?, enable_thinking?, reasoning_effort?, q38})
 #include "../src/chat.h"
 #include "../src/chat_jinja.h"

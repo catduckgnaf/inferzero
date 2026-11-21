@@ -41,6 +41,11 @@ runz and the other tools print as before, byte for byte: the bench scripts parse
 - **GPU:** name, driver, EUs, clock, memory (shared with the CPU or its own), XMX, sub-group sizes.
 - **Switches:** every `ARC_*` variable set (any case), with its value; your user folder in a value shows as
   `%USERPROFILE%`. A name with TOKEN, SECRET, PASS, KEY, AUTH, CRED or COOKIE shows `(set)` only.
+- **Options:** the speed and accuracy options in effect, by their titles in `scripts/options.tsv`
+  ([options.md](options.md)): `options: CPU experts: off; Copy drafting; Resident weights (12)`, or `none (the
+  defaults)`. It names an env option whose variable is set and a flag option on the command line, however they were
+  chosen (a launcher, `zero-server -Opt`, Docker's `OPTIONS`, by hand). A value the catalog doesn't name shows as
+  `(NAME=value)`.
 - **GPU line:** after the NPU and speech to text have started (its probe would hide the NPU from them).
 
 **At each model load:**

@@ -1,0 +1,6 @@
+<bos><|turn>system
+<|think|>
+Be careful.<turn|>
+<|turn>user
+2+2?<turn|>
+<|turn>model

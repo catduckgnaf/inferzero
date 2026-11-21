@@ -249,6 +249,22 @@
   }
   GpuWeight make_weight(uint32_t type, const uint8_t* data, size_t nbytes, int N, int K, int role = kRoles - 1,
                         const cl_mem* view = nullptr) {
+    // (QUEUE Q2, 2026-11-21: a type with no GPU kernel, Q4_1, Q5_0 or Q8_1, is decoded here on the CPU and stored as
+    //  Q8_0, said once per type; it threw "unsupported weight type" before. Q8_0's 8-bit steps are finer than those
+    //  types' 4-5 bits, so little is lost; the memory it takes is said in the line)
+    if (!view && N > 0 && (type == GGML_Q4_1 || type == GGML_Q5_0 || type == GGML_Q8_1) && K % 32 == 0) {
+      const size_t rb = nbytes / (size_t)N;
+      const std::vector<uint8_t> q8 = requant_rows_q8_0(type, data, rb, N, K);
+      static std::mutex said_mu;
+      static std::set<uint32_t> said;
+      {
+        std::lock_guard<std::mutex> g(said_mu);
+        if (said.insert(type).second)
+          zlog::eprintf("inferzero: %s weights have no GPU kernel yet: decoded on the CPU at load and kept as Q8_0 "
+                        "(%.2f -> %.2f bytes a value)\n", ggml_type_name(type), (double)rb / K, 34.0 / 32.0);
+      }
+      return make_weight(GGML_Q8_0, q8.data(), q8.size(), N, K, role, nullptr);
+    }
     GpuWeight w;
     w.role = role;
     w.type = type;
@@ -281,15 +297,25 @@
       w.wq = buf(qb);
       w.wh = buf(hb);
       if (!opt.dry) decode_w8(w, w.wq, w.wh);
+      if (p140_res_) {  // (the long chunks' just-in-time decode: zero/xe2/engine_xe2.h)
+        stage_need_q_[w.role] = std::max(stage_need_q_[w.role], qb);
+        stage_need_h_[w.role] = std::max(stage_need_h_[w.role], hb);
+      }
     } else {
       stage_need_q_[w.role] = std::max(stage_need_q_[w.role], qb);
       stage_need_h_[w.role] = std::max(stage_need_h_[w.role], hb);
     }
     return w;
   }
+  // (11-16, 2026-11-21, QUEUE K1: the shared expert, the router, a / b and the indexer had the last slot together, so in a layer-major
+  //  prompt they took it from each other and were decoded again for every chunk: Flash Next, 4 chunks of 512, 1,124
+  //  decode_w8 launches for 398 in one chunk. Their own slots: once per segment. Not H8's roles, engine_h8.h)
   static int weight_role(const std::string& name) {
     static const char* roles[] = {"attn_qkv.", "attn_gate.", "ssm_out.", "attn_q.", "attn_k.", "attn_v.",
-                                  "attn_output.", "ffn_gate.", "ffn_up.", "ffn_down.", "nextn.eh_proj."};
+                                  "attn_output.", "ffn_gate.", "ffn_up.", "ffn_down.", "nextn.eh_proj.",
+                                  "ffn_gate_shexp.", "ffn_up_shexp.", "ffn_down_shexp.", "ffn_gate_inp.", "ssm_alpha.",
+                                  "indexer."};
+    static_assert(sizeof(roles) / sizeof(roles[0]) < kRoles, "the last role is the shared slot");
     for (int r = 0; r < (int)(sizeof(roles) / sizeof(roles[0])); ++r)
       if (name.find(roles[r]) != std::string::npos) return r;
     return kRoles - 1;
@@ -302,13 +328,23 @@
       throw std::runtime_error("unexpected tensor shape: " + t.name);
     return t;
   }
+  // (one log line per type that has no GPU kernel and is requantized at load; the float types say nothing, as before)
+  static void note_requant(uint32_t t) {
+    if (t != GGML_Q4_1 && t != GGML_Q5_0 && t != GGML_Q8_1) return;
+    static std::mutex mu;
+    static std::set<uint32_t> said;
+    std::lock_guard<std::mutex> g(mu);
+    if (said.insert(t).second)
+      zlog::eprintf("inferzero: %s weights have no GPU kernel yet: decoded on the CPU at load and kept as Q8_0\n",
+                    ggml_type_name(t));
+  }
   GpuWeight load_w(const std::string& name) {
     const GgufTensor& t = mat(T(name));
     const int K = (int)t.dims[0], N = (int)t.dims[1];
-    if (t.type == GGML_F32 || t.type == GGML_F16 || t.type == GGML_BF16) {
-      std::vector<float> v((size_t)N * K);
-      dequant_row(t.type, t.data, N * K, v.data());
-      auto q8 = quantize_rows_q8_0(v.data(), N, K);
+    if (float_type(t.type)) {
+      note_requant(t.type);
+      // (in row blocks: the same bytes as the whole matrix at once, without N x K floats in RAM)
+      const auto q8 = requant_rows_q8_0(t.type, t.data, t.nbytes / (size_t)N, N, K);
       return make_weight(GGML_Q8_0, q8.data(), q8.size(), N, K, weight_role(name));
     }
     return make_weight(t.type, t.data, t.nbytes, N, K, weight_role(name));
@@ -316,13 +352,16 @@
   // DeltaNet input projections (qkv, z = attn_gate, ab = alpha + beta). When qkv and z have the same quantized type
   // they are uploaded as one stack of rows (with ab, already Q8_0, when they are Q8_0 too): a single token runs one GEMV
   // over all of them (Layer::qz); the matrices are views of it, stored once.
-  static bool float_type(uint32_t t) { return t == GGML_F32 || t == GGML_F16 || t == GGML_BF16; }
+  // ("float": requantized to Q8_0 at load. The float types, and since 2026-11-21 the ones with no GPU kernel, Q4_1,
+  //  Q5_0 and Q8_1, decoded on the CPU: QUEUE Q2)
+  static bool float_type(uint32_t t) {
+    return t == GGML_F32 || t == GGML_F16 || t == GGML_BF16 || t == GGML_Q4_1 || t == GGML_Q5_0 || t == GGML_Q8_1;
+  }
   // a float matrix as the Q8_0 rows load_w would make of it (kept in `keep`), so that it can be stacked with others
   const GgufTensor& as_q8(const GgufTensor& t, GgufTensor& out, std::vector<uint8_t>& keep) {
     mat(t);
-    std::vector<float> v((size_t)t.dims[0] * t.dims[1]);
-    dequant_row(t.type, t.data, (int)v.size(), v.data());
-    keep = quantize_rows_q8_0(v.data(), (int)t.dims[1], (int)t.dims[0]);
+    note_requant(t.type);
+    keep = requant_rows_q8_0(t.type, t.data, t.nbytes / (size_t)t.dims[1], (int)t.dims[1], (int)t.dims[0]);
     out = t;
     out.type = GGML_Q8_0;
     out.data = keep.data();
@@ -397,9 +436,9 @@
     L.qkv.iq3t = L.z.iq3t = L.qz.iq3t;  // (views of the stack: its layout; rows start at whole pairs)
     if (L.qz_ab) {
       const cl_mem va = view(C + Di, nab);
-      L.ab = make_weight(GGML_Q8_0, ab.data(), ab.size(), nab, E, kRoles - 1, &va);  // (nab % 64 == 0: not padded)
+      L.ab = make_weight(GGML_Q8_0, ab.data(), ab.size(), nab, E, weight_role(p + "ssm_alpha.weight"), &va);  // (nab % 64 == 0: not padded)
     } else {
-      L.ab = make_weight(GGML_Q8_0, ab.data(), ab.size(), tp_rows(nab), E);
+      L.ab = make_weight(GGML_Q8_0, ab.data(), ab.size(), tp_rows(nab), E, weight_role(p + "ssm_alpha.weight"));
     }
   }
   // Two matrices with the same K stacked by rows, requantized to Q8_0 (the tiny DeltaNet gate projections).
@@ -408,27 +447,24 @@
   // BF16 / F16 / F32 matrices (Qwen3-ASR's BF16 file) are requantized to Q8_0 row by row, as a single one is.
   GpuWeight load_w_stack(std::initializer_list<std::string> names) {
     const GgufTensor& t0 = T(*names.begin());
-    const bool flt = t0.type == GGML_F32 || t0.type == GGML_F16 || t0.type == GGML_BF16;
+    const bool flt = float_type(t0.type);
+    if (flt) note_requant(t0.type);
     const int K = (int)t0.dims[0];
     std::vector<uint8_t> cat;
-    std::vector<float> v;
     int N = 0;
     for (const std::string& n : names) {
       const GgufTensor& t = T(n);
       if (t.type != t0.type || t.dims[0] != t0.dims[0])
         throw std::runtime_error("load_w_stack: matrices of different shapes or types: " + n);
       if (flt) {
-        v.resize((size_t)(N + t.dims[1]) * K);
-        dequant_row(t.type, t.data, (int)(t.dims[1] * K), v.data() + (size_t)N * K);
+        const auto q = requant_rows_q8_0(t.type, t.data, t.nbytes / (size_t)t.dims[1], (int)t.dims[1], K);
+        cat.insert(cat.end(), q.begin(), q.end());
       } else {
         cat.insert(cat.end(), t.data, t.data + t.nbytes);
       }
       N += (int)t.dims[1];
     }
-    if (flt) {
-      auto q8 = quantize_rows_q8_0(v.data(), N, K);
-      return make_weight(GGML_Q8_0, q8.data(), q8.size(), N, K, weight_role(*names.begin()));
-    }
+    if (flt) return make_weight(GGML_Q8_0, cat.data(), cat.size(), N, K, weight_role(*names.begin()));
     return make_weight(t0.type, cat.data(), cat.size(), N, K, weight_role(*names.begin()));
   }
   GpuWeight load_q8_concat(const std::string& a, const std::string& b) {
@@ -439,7 +475,7 @@
     dequant_row(ta.type, ta.data, Na * K, v.data());
     dequant_row(tb.type, tb.data, Nb * K, v.data() + (size_t)Na * K);
     auto q8 = quantize_rows_q8_0(v.data(), Np, K);
-    return make_weight(GGML_Q8_0, q8.data(), q8.size(), Np, K);
+    return make_weight(GGML_Q8_0, q8.data(), q8.size(), Np, K, weight_role(a));
   }
   // a weight matrix of the size the model's dimensions give (N rows, rows of K; -1: any): one wider than the buffer
   // its product writes, or longer rows than the activations hold, would go past them on the GPU (a broken or
@@ -470,7 +506,7 @@
     // (more rows than the model's dimension: the padded copy below has room for Np rows only)
     if (N > Np) throw std::runtime_error("unexpected tensor shape: " + name + " has " + std::to_string(N) + " rows, the model " + std::to_string(Np));
     if (K % 256 == 0 && N == Np) return load_w(name);
-    if (t.type == GGML_F32 || t.type == GGML_F16 || t.type == GGML_BF16) {  // (as load_w: requantized to Q8_0, padded
+    if (float_type(t.type)) {  // (as load_w: requantized to Q8_0, padded
       const int Kp = padded_k(K);                                            //  with zeros to Np rows of Kp values)
       std::vector<float> v((size_t)Np * Kp, 0.0f);
       std::vector<float> row(K);
@@ -528,6 +564,13 @@
   //  token by token, 3,584 of prose), at -16 % prompt and -6 % generation on the laptop (0.73 GiB more read a token,
   //  out of the expert cache). ARC_FN_HCBF16=0: the Q8_0 rows of before. ARC_FN_AB32=1 DeltaNet's alpha / beta in f32)
   bool hc_bf16() const { return fn_precise() || hc_bf16_env(); }
+  // ARC_FN_KV16=1 (a test, 2026-11-21, the user for manoreken2's stray words, #4): only precise mode's attention part,
+  // the K / V cache in f16 and the scores in f32, the default mode otherwise (one pass, the default experts and H8):
+  // whether the int8 keys carry the cross-language words
+  bool fn_kv16() const {
+    static const bool env = getenv("ARC_FN_KV16") && atoi(getenv("ARC_FN_KV16")) != 0;
+    return env;
+  }
   bool fn_ab32() const {
     static const bool env = getenv("ARC_FN_AB32") && atoi(getenv("ARC_FN_AB32")) != 0;
     return fn_precise() || env;
@@ -593,7 +636,9 @@
   void adopt_mtp_file() {
     const std::string a = f_.get_str("general.architecture");
     // (--draft dflash without a DFlash2 folder still drafts with the block, as init() decides after this)
-    if (a != "qwen4exp" || !opt.mtp || (!opt.mtp_block && !opt.dflash.empty())) return;
+    // (qwen35: a fine-tune shipped without its nextn block takes its base model's, e.g. the Qwen3.8 27B
+    //  GGUF's block: --mtp-model <base model .gguf>; drafts are verified, so the output stays the model's own)
+    if ((a != "qwen4exp" && a != "qwen35") || !opt.mtp || (!opt.mtp_block && !opt.dflash.empty())) return;
     const int64_t nb = f_.get_int(a + ".block_count", 0);
     if (nb <= 0 || f_.get_int(a + ".nextn_predict_layers", 0) > 0) return;  // (a block of its own)
     const std::string mp = "blk." + std::to_string(nb) + ".";
@@ -603,9 +648,17 @@
         if (g->get_str("general.architecture") != a || g->get_int(a + ".block_count", 0) != nb + 1 ||
             g->get_int(a + ".nextn_predict_layers", 0) != 1 ||
             g->get_int(a + ".embedding_length", -1) != f_.get_int(a + ".embedding_length", -2) ||
-            g->get_int(a + ".expert_count", -1) != f_.get_int(a + ".expert_count", -2) ||
+            g->get_int(a + ".expert_count", -1) != f_.get_int(a + ".expert_count", -1) ||  // (dense: both absent)
             !g->find(mp + "nextn.eh_proj.weight"))
           return false;
+        // (and the same heads, head sizes and vocabulary: a head from another model of the same width would load
+        //  and draft nothing useful, or index past this model's embedding; 2026-11-21, with PR #68)
+        for (const char* k : {".attention.head_count", ".attention.head_count_kv", ".attention.key_length",
+                              ".attention.value_length", ".feed_forward_length"})
+          if (g->get_int(a + k, -1) != f_.get_int(a + k, -1)) return false;
+        const GgufTensor* te = g->find("token_embd.weight");
+        const GgufTensor* tm = f_.find("token_embd.weight");
+        if (te && tm && te->dims != tm->dims) return false;
         mtp_file_ = std::move(g);
         return true;
       } catch (const std::exception&) {
@@ -637,12 +690,18 @@
   void load_weights() {
     // The output head first: the GPU reads a large buffer allocated late in the load (after gigabytes of other
     // weights) at about half the speed (Gemma 4 12B's 826 MB head: 14 ms per token first, 21-28 ms last).
-    load_head();
+    // (a layer split's stage, opt.pp_begin / pp_end: its layers only, in layers_ from 0 with each layer's own il; the
+    //  head and the MTP block on the last stage only; Qwen's dense and MoE models, not Gemma or DeepSeek)
+    const int lb = std::max(0, opt.pp_begin), le = opt.pp_end < 0 ? hp.n_layer : std::min(opt.pp_end, hp.n_layer);
+    if ((lb > 0 || le < hp.n_layer) && (hp.gemma || hp.ds41 || hp.hc || hp.moe || hp.ple_layer >= 0 || lb >= le))
+      throw std::runtime_error("--split layer: Qwen's dense models only for now (not MoE, Gemma, DeepSeek or Flash Next) and a "
+                               "non-empty range of layers");
+    if (pp_last()) load_head();
     if (hp.gemma) return load_weights_gemma4();
     if (hp.ds41) return load_weights_ds41();
-    layers_.resize(hp.n_layer);
-    for (int il = 0; il < hp.n_layer; ++il) {
-      Layer& L = layers_[il];
+    layers_.resize(le - lb);
+    for (int il = lb; il < le; ++il) {
+      Layer& L = layers_[il - lb];
       L.il = il;
       const std::string p = "blk." + std::to_string(il) + ".";
       if (hp.hc) {
@@ -709,7 +768,7 @@
     const std::string mp = "blk." + std::to_string(hp.n_layer) + ".";
     const size_t g_mtp = gpu_bytes;
     struct MtpBytes { Engine& e; size_t g0; ~MtpBytes() { e.mem_mtp_ += e.gpu_bytes - g0; } } mtp_bytes{*this, g_mtp};
-    if (opt.mtp && opt.mtp_block && f_.find(mp + "nextn.eh_proj.weight")) {
+    if (opt.mtp && opt.mtp_block && pp_last() && f_.find(mp + "nextn.eh_proj.weight")) {
       has_mtp = mtp_block_ = true;
       mtp_.il = hp.n_layer;
       if (hp.hc) {  // (Flash Next, QUEUE F34: a layer as its others, with the mixers; no PLE)
@@ -752,6 +811,15 @@
     // DFlash2 (with or without the MTP block: with both, mtp_draft picks one per step; Flash Next: the features are the
     // means of the residual streams, the PLE / QSA state rolled back in verify_done)
     if (!opt.dflash.empty()) load_dflash(opt.dflash);
+    // (--mtp on a file without the MTP block and no drafter: said, not plain decoding in silence. Unsloth's
+    //  Qwen3.6-35B-A3B-UD-Q4_K_M.gguf has none: a B390 owner saw --mtp run at plain speed with no MTP line, issue #75)
+    if (opt.mtp && opt.mtp_block && pp_last() && !has_mtp && !opt.dry && !opt.copy_draft) {
+      static std::once_flag said;
+      std::call_once(said, [] {
+        LOG_WRN("--mtp: this model file has no MTP block (no blk.N.nextn tensors) and no drafter: plain decoding. A "
+                "GGUF with the block drafts (for Qwen, an \"-MTP-GGUF\" repository's file), or --mtp-model a head\n");
+      });
+    }
   }
 
   // MoE FFN: the router and the shared-expert gate requantized together to Q8_0 (one GEMM gives both), the shared

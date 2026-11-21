@@ -9,6 +9,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <string>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -23,6 +24,9 @@
 #include <cerrno>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <setjmp.h>  // (sigsetjmp: guarded_copy)
+#include <signal.h>
+#include <sys/file.h>  // (flock: BuildLock)
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -369,6 +373,40 @@ class DirectWriter {
     return fd_ >= 0;
 #endif
   }
+  // An existing file, not truncated, written on from byte `off` (a 4 KB multiple): an expert file's build going on
+  // after a stop (S2, 2026-11-21)
+  bool open_at(const char* path, uint64_t off) {
+    close();
+#ifdef _WIN32
+    h_ = CreateFileA(path, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (h_ == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)off;
+    if (!SetFilePointerEx(h_, li, nullptr, FILE_BEGIN)) {
+      close();
+      return false;
+    }
+    return true;
+#else
+    fd_ = ::open(path, O_WRONLY | O_DIRECT | O_CLOEXEC);
+    if (fd_ < 0 && errno == EINVAL) fd_ = ::open(path, O_WRONLY | O_CLOEXEC);
+    if (fd_ < 0) return false;
+    if (::lseek(fd_, (off_t)off, SEEK_SET) != (off_t)off) {
+      close();
+      return false;
+    }
+    return true;
+#endif
+  }
+  // what was written is on the drive (Windows: write-through already, the flush is cheap; Linux: O_DIRECT bypasses
+  // the cache but not the drive's own, fdatasync)
+  bool sync() {
+#ifdef _WIN32
+    return FlushFileBuffers(h_) != 0;
+#else
+    return ::fdatasync(fd_) == 0;
+#endif
+  }
   bool is_open() const {
 #ifdef _WIN32
     return h_ != INVALID_HANDLE_VALUE;
@@ -533,6 +571,68 @@ inline void prefetch_mapped(const void* p, size_t n) {
   madvise((void*)a, n + ((uintptr_t)p - a), MADV_WILLNEED);
 #endif
 }
+// S4 (2026-11-21): a copy out of a file mapping that comes back false when a page cannot be read (a drive error, a
+// file shrunk under the mapping) instead of ending the process: Windows EXCEPTION_IN_PAGE_ERROR caught around the copy,
+// Linux SIGBUS through a handler that jumps back while this thread copies (other threads' SIGBUS as before: the
+// default action). The caller then reads the same bytes with read calls, which return errors (read_file_at)
+#ifdef _WIN32
+inline bool guarded_copy(void* d, const void* s, size_t n) {
+  __try {
+    memcpy(d, s, n);
+    return true;
+  } __except (GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+    return false;
+  }
+}
+#else
+inline thread_local sigjmp_buf* g_bus_jump = nullptr;
+inline struct sigaction g_bus_old{};  // (the handler before: the crash log's, src/crash_log.h)
+extern "C" inline void bus_on_signal(int sig, siginfo_t* si, void* ctx) {
+  if (g_bus_jump) siglongjmp(*g_bus_jump, 1);
+  // (not in a guarded copy: the handler before ours, so the crash log still reports it)
+  if ((g_bus_old.sa_flags & SA_SIGINFO) && g_bus_old.sa_sigaction) {
+    g_bus_old.sa_sigaction(sig, si, ctx);
+    return;
+  }
+  sigaction(SIGBUS, &g_bus_old, nullptr);
+  raise(sig);
+}
+inline bool guarded_copy(void* d, const void* s, size_t n) {
+  static const bool installed = [] {
+    struct sigaction sa{};
+    sa.sa_sigaction = bus_on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    return sigaction(SIGBUS, &sa, &g_bus_old) == 0;
+  }();
+  if (!installed) {
+    memcpy(d, s, n);
+    return true;
+  }
+  sigjmp_buf jb;
+  if (sigsetjmp(jb, 1)) {
+    g_bus_jump = nullptr;
+    return false;
+  }
+  g_bus_jump = &jb;
+  memcpy(d, s, n);
+  g_bus_jump = nullptr;
+  return true;
+}
+#endif
+// n bytes of `path` from byte `off` with read calls (no mapping), or false
+inline bool read_file_at(const std::string& path, uint64_t off, void* dst, size_t n) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return false;
+#ifdef _WIN32
+  bool ok = _fseeki64(f, (long long)off, SEEK_SET) == 0;
+#else
+  bool ok = fseeko(f, (off_t)off, SEEK_SET) == 0;
+#endif
+  ok = ok && fread(dst, 1, n, f) == n;
+  fclose(f);
+  return ok;
+}
 // [p, p + n) of a read-only file mapping, already copied out, leaves this process (Linux madvise MADV_DONTNEED on the
 // whole pages inside the range; a later read faults them in again from the file). A pass over a whole GGUF otherwise
 // kept every page it touched mapped until the pass ended, which counts against a container's memory limit.
@@ -564,6 +664,42 @@ struct KeepAwake {
   KeepAwake(const KeepAwake&) = delete;
   KeepAwake& operator=(const KeepAwake&) = delete;
   static int& depth() { thread_local int d = 0; return d; }
+};
+// An exclusive lock on `path` (a small file beside a build's .tmp) while one lives: a second process that wants to
+// build the same file finds it held (held() false) instead of removing a .tmp another process is still writing
+// (self audit 2026-11-20 A9). Windows: the file opened without sharing and deleted on close; Linux: flock, the file
+// removed by its holder before letting go. A lock that cannot be made for another reason (a read-only folder) counts as
+// held: the build goes on as before.
+struct BuildLock {
+  explicit BuildLock(const std::string& path) : path_(path) {
+#ifdef _WIN32
+    h_ = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE,
+                     nullptr);
+    busy_ = h_ == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION;
+#else
+    fd_ = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+    busy_ = fd_ >= 0 && flock(fd_, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+    if (busy_) { ::close(fd_); fd_ = -1; }
+#endif
+  }
+  ~BuildLock() {
+#ifdef _WIN32
+    if (h_ != INVALID_HANDLE_VALUE) CloseHandle(h_);
+#else
+    if (fd_ >= 0) { ::unlink(path_.c_str()); ::close(fd_); }
+#endif
+  }
+  bool held() const { return !busy_; }
+  BuildLock(const BuildLock&) = delete;
+  BuildLock& operator=(const BuildLock&) = delete;
+ private:
+  std::string path_;
+  bool busy_ = false;
+#ifdef _WIN32
+  HANDLE h_ = INVALID_HANDLE_VALUE;
+#else
+  int fd_ = -1;
+#endif
 };
 // `from` renamed to `to`, an existing `to` replaced: false on failure (last_error() says why)
 inline bool replace_file(const char* from, const char* to) {

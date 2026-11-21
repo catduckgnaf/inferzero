@@ -343,11 +343,11 @@ screenshots: how the window looks is inferred from the code). Abbreviations: L `
 
 | # | Rank | Finding | Fix |
 |---|---|---|---|
-| 1 | high | The window is 1240 x 820 times the DPI factor (L186): taller than a 1080p / 1200p laptop's work area at 150 %, so Start / Stop can sit below the edge | size clamped to `Screen.WorkingArea`; Start / Stop in the header beside the status |
+| 1 | high | The window is 1240 x 820 times the DPI factor (L186): taller than a 1080p / 1200p laptop's work area at 150 %, so Start / Stop can sit below the edge | size clamped to `Screen.WorkingArea`; Start / Stop in the header beside the status. ✅ (the WorkingArea clamp) |
 | 2 | high | CLI names and engine terms in the basic view: "(-Whisper)", "(-Asr)", "-Precise ... KL 0.0105 -> 0.0060" (L337), "MTP drafts", "Id (Pi /model) [shortcut]", "Variant"; advanced: "Resident W8 weights", "--no-swap", "-NoStream", "f32 attention (tests)" | plain labels, the CLI name in a tooltip; Accuracy and MTP drafts to advanced; the test-only switch removed |
 | 3 | high | Downloads are modal and stop when their dialog closes (DL313, FR219): the launcher is unusable during a multi-GB download | the download runs in the main window's message bar (or a Downloads tab); the dialog only chooses |
-| 4 | high | An update leaves the desktop shortcut (FR130 makes one only if none exists) and the PATH entry (SU304) on the old folder | on the first run from a new folder, offer to point the shortcut (and PATH) here |
-| 5 | high | "Reachable from other computers" (0.0.0.0) still shows 127.0.0.1 and no warning (L329, L384) | show the LAN address(es) and a "no password" warning bar, as SH271 does |
+| 4 | high | An update leaves the desktop shortcut (FR130 makes one only if none exists) and the PATH entry (SU304) on the old folder | on the first run from a new folder, offer to point the shortcut (and PATH) here. ✅ 2026-11-21: Test-OldInstall (launcher-firstrun.ps1), asked once a folder |
+| 5 | high | "Reachable from other computers" (0.0.0.0) still shows 127.0.0.1 and no warning (L329, L384) | show the LAN address(es) and a "no password" warning bar, as SH271 does. ✅ ($netWarn) |
 | 6 | medium | No "restart to apply" cue when the options differ from the running server's (`server.json`) | a line "Options changed: Start restarts with them", Start relabelled Restart |
 | 7 | medium | Two first-download dialogs that behave differently (FR73 vs DL53): only Downloads retries and pauses, only Welcome auto-starts | one dialog: Welcome's plain descriptions and RAM fit, Downloads' retry / pause / links, auto-start after any download |
 | 8 | medium | "needs a laptop with an Intel Core Ultra" (FR27, SU101, SU103) excludes A-series / B-series cards | "an Intel Arc GPU (a Core Ultra laptop, or an Arc A / B card)" |

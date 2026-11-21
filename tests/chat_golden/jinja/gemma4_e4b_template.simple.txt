@@ -1,0 +1,3 @@
+<bos><|turn>user
+Halo, apa kabar?<turn|>
+<|turn>model

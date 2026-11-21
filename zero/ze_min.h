@@ -47,6 +47,14 @@ struct ze_device_properties_t {
   uint8_t uuid[16];
   char name[256];
 };
+#define ZE_STYPE_DEVICE_COMPUTE_PROPERTIES 0x4u
+#define ZE_SUBGROUPSIZE_COUNT 8
+struct ze_device_compute_properties_t {
+  ze_structure_type_t stype;
+  void* pNext;
+  uint32_t maxTotalGroupSize, maxGroupSizeX, maxGroupSizeY, maxGroupSizeZ, maxGroupCountX, maxGroupCountY, maxGroupCountZ,
+      maxSharedLocalMemory, numSubGroupSizes, subGroupSizes[ZE_SUBGROUPSIZE_COUNT];
+};
 struct ze_device_memory_properties_t {
   ze_structure_type_t stype;
   void* pNext;
@@ -100,6 +108,7 @@ struct ze_kernel_timestamp_result_t { ze_kernel_timestamp_data_t global, context
   X(ze_result_t, zeDriverGet, (uint32_t*, ze_driver_handle_t*))                                                  \
   X(ze_result_t, zeDeviceGet, (ze_driver_handle_t, uint32_t*, ze_device_handle_t*))                              \
   X(ze_result_t, zeDeviceGetProperties, (ze_device_handle_t, ze_device_properties_t*))                           \
+  X(ze_result_t, zeDeviceGetComputeProperties, (ze_device_handle_t, ze_device_compute_properties_t*))             \
   X(ze_result_t, zeDeviceGetMemoryProperties, (ze_device_handle_t, uint32_t*, ze_device_memory_properties_t*))    \
   X(ze_result_t, zeDeviceGetCommandQueueGroupProperties,                                                         \
     (ze_device_handle_t, uint32_t*, ze_command_queue_group_properties_t*))                                       \

@@ -335,7 +335,12 @@ class VisionQwen3VL {
   }
   cl_kernel kern(const char* name, const std::string& defs) { return e_.kernel("ops", "-DVIT " + defs, name); }
   // C[:, c_off : c_off + w.N] (+)= A[rows][K] * W^T for M (padded, a multiple of 16) rows, n of them stored
+  bool path_said_ = false;  // (E0: the GEMM path's log line written)
   void gemm(cl_mem A, int lda, const FW& w, cl_mem C, int ldc, int c_off, bool acc, int M, int n) {
+    if (!path_said_) {  // (E0, 2026-11-21: what this encoder's GEMMs run on, said once)
+      path_said_ = true;
+      zlog::eprintf("inferzero: the vision encoder (Qwen3-VL): %s\n", w.q8.raw ? (std::string("int8 GEMMs, two passes, on the prompt GEMM (") + e_.gemm_path_name(w.q8.gemm_qtype) + ")").c_str() : "f16 GEMMs (vit_gemm_f16, no XMX)");
+    }
     if (w.q8.raw) {  // two int8 passes on the engine's GEMM, rows in equal chunks of at most q2_rows_
       const int nch = (n + q2_rows_ - 1) / q2_rows_, rows = ((n + nch - 1) / nch + 127) / 128 * 128;
       cl_kernel kq = kern("vit_quant_pad", q2defs_);

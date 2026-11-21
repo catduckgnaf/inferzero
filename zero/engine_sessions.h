@@ -663,7 +663,7 @@
          qsc_ = nullptr, apart_ = nullptr;
   // just-in-time W8 staging, one slot per matrix role (attn_qkv, ffn_up, ...): a layer's matrices stay decoded
   // while several chunks go through it (layer-major prefill)
-  static constexpr int kRoles = 16;
+  static constexpr int kRoles = 20;  // (weight_role's 17 named slots and the shared last one; 2026-11-21: 16 -> 20)
   cl_mem stage_q_[kRoles] = {}, stage_h_[kRoles] = {};
   bool has_rgu_ = false;      // MoE: stacked router + shared-expert gate / up weights (Layer::rgu)
   cl_mem rgu_out_ = nullptr, rgu_gu_ = nullptr;

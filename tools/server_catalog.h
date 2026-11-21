@@ -638,6 +638,7 @@ static std::string ctx_key(const std::string& model, const EngineOptions& eo) {
          (eo.mtp_model.empty() ? std::string() : "mm" + std::filesystem::path(eo.mtp_model).filename().string() + "|") +
          (eo.min_chunk ? "/" + std::to_string(eo.min_chunk) : std::string()) + "|" + (eo.mtp ? "mtp" : "-") + "|" + (!eo.attn_int8 ? "f32" : precise_model(model) ? "p16" : "i8") + "|" + std::to_string(device_global_mem()) +
          (eo.tp_size > 1 ? "|tp" + std::to_string(eo.tp_size) + (getenv("ARC_TP_SIM") ? "sim" : "") : std::string()) +  // (a split model: shard 0's memory)
+         (eo.pp_size > 1 ? "|pp" + std::to_string(eo.pp_begin) + "-" + std::to_string(eo.pp_end) + "/" + std::to_string(eo.pp_size) + (getenv("ARC_TP_SIM") ? "sim" : "") : std::string()) +  // (a layer split: one stage's layers)
          "|kf" + std::string(getenv("ARC_G4_KF16") ? getenv("ARC_G4_KF16") : "") + "/" +
          std::string(getenv("ARC_Q3_KF32") ? getenv("ARC_Q3_KF32") : "") +  // (the float K rows' size)
          hc_rows_tag(model) + "|m26";  // engine memory layout version (m26: a dense model larger than a discrete card keeps weights in RAM,
@@ -769,7 +770,7 @@ static AutoCtx auto_ctx(const std::string& model, EngineOptions eo, bool budget_
     Engine probe(model, e2);
     res = probe.w8_resident;
     const double gib = 1073741824.0,
-                 budget = probe.device_mem() / (e2.tp_size > 1 && getenv("ARC_TP_SIM") ? e2.tp_size : 1) -
+                 budget = probe.device_mem() / (e2.tp_size > 1 && getenv("ARC_TP_SIM") ? e2.tp_size : e2.pp_size > 1 && getenv("ARC_TP_SIM") ? e2.pp_size : 1) -
                           Engine::driver_slack() - probe.snapshot_bytes() - (double)reserve;  // (ARC_TP_SIM: every shard on GPU 0)
     const double base = (double)probe.gpu_bytes - (double)probe.ctx_bytes(e2.ctx);
     // (--slots N: N - 1 more KV caches, states and snapshots of the same context)

@@ -936,6 +936,14 @@
       eng_.prof_ms.clear();
       eng_.prof_n.clear();
     }
+    // (streamed MoE: the expert reads so far, as runz prints them at its end: what each request read from the SSD and
+    //  the RAM tier shows as the difference to the line before; issue #47, a B65 whose later prompts were not faster)
+    if (const std::string xs = eng_.expert_stats(); !xs.empty())
+      for (size_t a = 0, b; a < xs.size(); a = b + 1) {  // (one log line each: the experts, the host times, ARC_XCPU's)
+        b = xs.find('\n', a);
+        if (b == std::string::npos) b = xs.size();
+        LOG_INF("[%s] since start, %s\n", id.c_str(), xs.substr(a, b - a).c_str());
+      }
     if (n_drafts) {
       timings.set("draft_n", n_drafts);
       timings.set("draft_n_accepted", n_accepted);

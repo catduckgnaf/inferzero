@@ -367,7 +367,7 @@ if (-not $model -and -not $pick) {
   $last = Join-Path $stateDir "last-model.txt"
   if ($running) { $model = $running }
   elseif (Test-Path $last) {
-    $lp = (Get-Content $last -Raw).Trim()
+    $lp = (Get-Content -Encoding UTF8 $last -Raw).Trim()
     if ($lp -and (Test-Path $lp)) { $model = $lp }
   }
 }

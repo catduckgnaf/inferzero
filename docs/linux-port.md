@@ -41,7 +41,7 @@ and since 2026-11-18 Docker and Kubernetes files (`docker/`, not tested yet).
 - **2026-11-18: Docker and Kubernetes** (`docker/`: `Dockerfile`, `compose.yaml`, `kubernetes.yaml`, `entrypoint.sh`;
   not tested yet, please report): an Ubuntu 24.04 image with Intel's GPU runtime (the `kobuk-team/intel-graphics` PPA
   added by hand: `add-apt-repository` brought Python into the image) and a release's Linux package; the container
-  starts the launcher with `MODEL`, `GPUS` and `SERVER_ARGS` and downloads the model at its first start. Compose
+  starts the launcher with `MODEL`, `GPUS`, `SERVER_ARGS` and `OPTIONS` (the options of docs/options.md, as `--no-saved-options --opt ...`) and downloads the model at its first start. Compose
   passes `/dev/dri`, keeps the models and compiled kernels on the host and runs a small init (a stop during the
   download); `ipc: host` and then `privileged: true` are commented fallbacks for a host where `zeInit` fails in the
   container (a B580 on Unraid, issue #40). Kubernetes takes the GPU from Intel's device plugin, with a 3-hour startup
@@ -53,7 +53,7 @@ and since 2026-11-18 Docker and Kubernetes files (`docker/`, not tested yet).
   stops the server again (it passes TERM: a background command of a non-interactive shell starts with SIGINT ignored).
 - **2026-11-15: no Python on Linux.** `zero-launcher.sh` is the whole launcher in bash (curl downloads into the Hugging
   Face cache layout, each file's size and SHA-256 from the repository's headers, `HF_TOKEN`); the benchmarks have bash
-  twins (`bench/website_bench.sh`, `b60_sweep.sh`, `decode_try.sh`); `tests/test_zero_launcher.sh` and
+  twins (`bench/website_bench.sh`, `gpu_sweep.sh`); `tests/test_zero_launcher.sh` and
   `tests/check_catalog_sync.sh` run in CI's `linux-package` job. `ref_forward` and `gpu_bench` build with g++ and are
   in the package (`plat::fseek64` for `_fseeki64`).
 - **2026-11-14: contributions for Linux.** `--install-service` never overwrites an existing unit without

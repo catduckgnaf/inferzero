@@ -1,0 +1,4 @@
+<|im_start|>user
+Halo, apa kabar?<|im_end|>
+<|im_start|>assistant
+<think>

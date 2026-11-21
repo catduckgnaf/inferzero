@@ -34,9 +34,9 @@ spec:
     metadata:
       labels: {app: inferzero}
     spec:
-      terminationGracePeriodSeconds: 60   # (a stop sends SIGTERM, SIGKILL after this. With serverz handling SIGTERM
-                                          #  (QUEUE D1, not yet: today it ends at once), a stop during a MoE model's
-                                          #  first load lets it clean up its expert file's .tmp)
+      terminationGracePeriodSeconds: 60   # (a stop sends SIGTERM, SIGKILL after this. serverz handles SIGTERM while
+                                          #  it builds an expert file or a package (zero/expert_store.h, since
+                                          #  2026-11-19): a stop during a MoE model's first load removes its .tmp)
       containers:
         - name: inferzero
           image: inferzero:latest  # your registry's name for the image (a :latest tag is pulled at every start)
@@ -44,6 +44,7 @@ spec:
             - {name: MODEL, value: "4b"}       # a catalog key (4b, 9b, 27b, 35b, flash, g12, g31, e4b) or a .gguf path
             - {name: GPUS, value: "1"}         # GPUs to split the model over: ask for as many below
             - {name: SERVER_ARGS, value: ""}   # more serverz options, e.g. "--ctx 32768"
+            - {name: OPTIONS, value: ""}       # speed and accuracy options (docs/options.md), e.g. "copy_draft,xcpu=off"
             - {name: HF_HOME, value: /cache/huggingface}
             - {name: ARC_DATA_DIR, value: /cache/inferzero}   # compiled kernels, expert files, settings
           ports:

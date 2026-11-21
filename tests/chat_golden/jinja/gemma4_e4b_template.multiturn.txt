@@ -1,0 +1,7 @@
+<bos><|turn>user
+1+1?<turn|>
+<|turn>model
+2<turn|>
+<|turn>user
+kali 3?<turn|>
+<|turn>model

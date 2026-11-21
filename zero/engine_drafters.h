@@ -576,8 +576,8 @@
     layer_attn(mtp_, n, Mp);
     if (hp.moe) layer_moe(mtp_, n, Mp);
     else layer_ffn(mtp_, n, Mp);
-    if (logits) {
-      head_rows(n - 1, 1, shnorm_, hout);
+    if (logits) {  // (only the drafts ask for logits here: the reduced head when ARC_MTP_VOCAB is on)
+      head_rows(n - 1, 1, shnorm_, hout, draft_head_on() ? &draft_head_ : nullptr);
     }
     x_ = saved_x;
     pos = saved_pos;
@@ -642,7 +642,8 @@
     if (logits) {
       cur_T_ = 1;
       hc_mix(mtp_hc_norm_, mtp_hc_down_, mtp_hc_up_, 1, 16, 1, n - 1);
-      matmul("lm_head", lm_head_, 16, logits_, n_logits(), 0, 0, true);
+      if (draft_head_on()) matmul("lm_head_draft", draft_head_, 16, logits_, draft_head_.N, 0, 0, true);  // (ARC_MTP_VOCAB)
+      else matmul("lm_head", lm_head_, 16, logits_, n_logits(), 0, 0, true);
     }
     x_ = saved_x;
     pos = saved_pos;
@@ -681,6 +682,76 @@
   }
 
  public:
+  // ---------------------------------------------------------------- D1: drafting over a reduced vocabulary
+  // ARC_MTP_VOCAB=N (2026-11-21, opt-in; QUEUE D1, the idea from FR-Spec, Zhao et al., ACL 2025; no code taken): the
+  // MTP block's drafts read only N rows of the output head, the most frequent tokens of the model's vocabulary
+  // (scripts/draft-vocab/vocab-<vocabulary size>.txt, tools/make_draft_vocab.ps1) and every control token, gathered
+  // at load into a head of their own (draft_head_, N / V of lm_head's bytes). Every draft of the full head ran all
+  // 248,320 rows: half of a Windows A770's drafting time (hansong80, #45), 23.7 % of the laptop's MTP GPU time.
+  // Verification keeps the whole vocabulary: a draft is kept only when the model's own pass picks the same token, so
+  // the text is plain's; a token outside the N is just never drafted (fewer drafts accepted, never a different text).
+  // The confidence test for a further draft (opt.mtp_min_p) then reads the probability within the N. Qwen's MTP block
+  // and Flash Next's; not Gemma's drafter or DFlash2, not a split model's shards
+  GpuWeight draft_head_;        // (empty when off)
+  std::vector<int> draft_ids_;  // (row i of draft_head_ is token draft_ids_[i])
+  static int mtp_vocab_env() {
+    static const int n = getenv("ARC_MTP_VOCAB") ? std::max(0, atoi(getenv("ARC_MTP_VOCAB"))) : 0;
+    return n;
+  }
+  // the ranked list next to the package (zero/kernels/../../scripts, kernels/../scripts) or in the folder run from
+  std::vector<int> draft_vocab_file(int V) const {
+    namespace fs = std::filesystem;
+    const std::string name = "vocab-" + std::to_string(V) + ".txt";
+    const fs::path kd(opt.kernel_dir);
+    std::vector<int> ids;
+    for (const fs::path& p : {kd / ".." / ".." / "scripts" / "draft-vocab" / name, kd / ".." / "scripts" / "draft-vocab" / name,
+                              fs::current_path() / "scripts" / "draft-vocab" / name}) {
+      std::ifstream f(p);
+      if (!f) continue;
+      for (std::string l; std::getline(f, l);) {
+        if (l.empty() || l[0] == '#') continue;
+        const int id = atoi(l.c_str());
+        if (id >= 0 && id < V) ids.push_back(id);
+      }
+      break;
+    }
+    return ids;
+  }
+  // (from load_head: the head's raw rows on the host, the type they were uploaded in)
+  void load_draft_head(uint32_t type, const uint8_t* data, size_t nbytes) {
+    const int want = mtp_vocab_env(), V = lm_head_.N;
+    if (!want || !opt.mtp || opt.tp_size > 1 || hp.gemma || V <= 0) return;
+    const int N = std::min(V, (want + 63) / 64 * 64);  // (whole groups of 64 rows: the GEMV's row groups)
+    if (N >= V) return;
+    std::vector<char> in(V, 0);
+    std::vector<int> ids;
+    auto take = [&](int id) {
+      if (id >= 0 && id < V && !in[id] && (int)ids.size() < N) in[id] = 1, ids.push_back(id);
+    };
+    // (the control and user-defined tokens first: the end of a turn, <think>, the tool-call tags must stay draftable)
+    if (const auto* ty = f_.get_ints("tokenizer.ggml.token_type"))
+      for (int i = 0; i < (int)ty->size() && i < V; ++i)
+        if ((*ty)[i] == 3 || (*ty)[i] == 4) take(i);
+    const std::vector<int> ranked = draft_vocab_file(V);
+    if (ranked.empty()) {
+      LOG_WRN("ARC_MTP_VOCAB=%d: no scripts/draft-vocab/vocab-%d.txt for this vocabulary: the full head drafts\n", want, V);
+      return;
+    }
+    for (int id : ranked) take(id);
+    for (int id = 0; id < V && (int)ids.size() < N; ++id) take(id);  // (past the list: the lowest ids, BPE's first merges)
+    const size_t rb = nbytes / (size_t)V;
+    std::vector<uint8_t> sub((size_t)N * rb);
+    for (int i = 0; i < N; ++i) memcpy(sub.data() + (size_t)i * rb, data + (size_t)ids[i] * rb, rb);
+    draft_head_.N = N;
+    draft_head_.K = lm_head_.K;
+    draft_head_.type = type;
+    draft_head_.raw = upload_padded(type, sub.data(), sub.size());
+    draft_ids_ = ids;
+    zlog::eprintf("inferzero: drafts from %d of the %d tokens (ARC_MTP_VOCAB; %d listed, %.0f MB of the head), "
+                  "verification from all\n", N, V, (int)ranked.size(), sub.size() / 1e6);
+  }
+  bool draft_head_on() const { return draft_head_.N > 0; }
+
   // ---------------------------------------------------------------- MTP speculative decoding (has_mtp)
   // Drafts per verification pass: Qwen's DeltaNet keeps state copies after tokens 0 and 1 (two drafts); Gemma has
   // no recurrent state, a rejected draft only moves the position back.
@@ -695,23 +766,68 @@
     return hp.gemma ? (hp.moe ? 3 : 2) : hp.hc ? 3 : hp.moe ? 5 : hp.n_embd >= 5120 ? 7 : hp.n_embd <= 2560 ? 3 : 2;
   }
   int max_drafts() const { return gemma_mtp_ ? 3 : std::clamp(opt.mtp_drafts, 2, kMaxDrafts); }
+  // The MTP block's KV rows of the pending accepted drafts and of `tok`, as its own drafts would write them, when
+  // another drafter (DFlash2, copy drafting) drafts this step: the block attends to every position once it drafts again
+  // (without the rows: stale memory)
+  void mtp_sync_rows(int tok) {
+    const size_t E4 = mtp_hw() * 4;  // (h rows: Flash Next hc * E)
+    std::vector<int> toks = pend_toks_;
+    const int np = (int)toks.size();
+    if (np) CL_CHECK(clEnqueueCopyBuffer(cl_.queue, hpend_, hfin_, 0, 0, np * E4, 0, nullptr, nullptr));
+    CL_CHECK(clEnqueueCopyBuffer(cl_.queue, hlast_, hfin_, 0, np * E4, E4, 0, nullptr, nullptr));
+    toks.push_back(tok);
+    pend_toks_.clear();
+    mtp_rows(toks.data(), hfin_, np + 1, pos - np, false);
+  }
+  // copy drafting (R1): the context s = hist + [tok]; the most recent earlier place where s's last n tokens (n from
+  // ARC_COPY_NGRAM, default 8, down to ARC_COPY_MIN, default 4) appear, and up to max_drafts of the tokens after it.
+  // A pass over the context from its end per n (~0.1 ms each at 100K tokens); nothing found: empty
+  bool copy_on() const {
+    static const bool e = getenv("ARC_COPY_DRAFT") && atoi(getenv("ARC_COPY_DRAFT")) != 0;
+    return opt.copy_draft || e;
+  }
+  static std::vector<int> copy_lookup(const std::vector<int>& h, int tok, int max_drafts) {
+    // (the 4B, 256 tokens, MTP 42.0 tok/s on a code edit, 29.4 on a summary: longest first from 8 down to 4 58.5 /
+    //  30.2, from 4 to 2 56.8 / 28.7 (the summary's 2-token matches 27 % right); 3 to 2 51.6 / 28.1)
+    static const int ng = getenv("ARC_COPY_NGRAM") ? std::clamp(atoi(getenv("ARC_COPY_NGRAM")), 1, 16) : 8;
+    static const int nmin = getenv("ARC_COPY_MIN") ? std::clamp(atoi(getenv("ARC_COPY_MIN")), 1, ng) : std::min(ng, 4);
+    const int L = (int)h.size() + 1;  // (s[L - 1] = tok)
+    auto s = [&](int i) { return i == L - 1 ? tok : h[i]; };
+    for (int n = std::min(ng, L - 1); n >= nmin; --n) {
+      // j: the last token of an earlier match (j < L - 1), the drafts s[j + 1 ..]
+      for (int j = L - 2; j >= n - 1; --j) {
+        int k = 0;
+        while (k < n && s(j - k) == s(L - 1 - k)) ++k;
+        if (k < n) continue;
+        std::vector<int> d;
+        for (int i = j + 1; i < L && (int)d.size() < max_drafts; ++i) d.push_back(s(i));
+        return d;
+      }
+    }
+    return {};
+  }
+  bool copy_used_ = false;
+  bool last_draft_copy() const { return copy_used_; }  // the drafts of the last mtp_draft were copied (R1)
   // `tok` is the next token (sampled, not yet processed; it goes to position pos). Returns up to `max_drafts` greedy
   // drafts of the MTP block for the tokens after it: the second one is chained on the block's own output and only
   // made when the first has probability >= opt.mtp_min_p.
-  std::vector<int> mtp_draft(int tok, int max_drafts) {
+  // hist: the tokens before `tok` (positions 0 .. pos - 1, the accepted drafts included). With opt.copy_draft, when the
+  // last tokens up to `tok` appeared earlier in it, the tokens that followed there are the drafts (copy drafting, R1)
+  std::vector<int> mtp_draft(int tok, int max_drafts, const std::vector<int>* hist = nullptr) {
+    copy_used_ = false;
+    if (hist && copy_on()) {
+      const int md = std::clamp(max_drafts, 1, std::min(this->max_drafts(), std::max(1, ctx - pos - 1)));
+      std::vector<int> cd = copy_lookup(*hist, tok, md);
+      if (!cd.empty()) {
+        dfl_used_ = false;
+        copy_used_ = true;
+        if (mtp_block_) mtp_sync_rows(tok);  // (the block's KV rows of the pending tokens and `tok`, as its drafts would)
+        return cd;
+      }
+    }
     dfl_used_ = dfl_ && (!mtp_block_ || dfl_pick());
     if (dfl_used_) {
-      if (mtp_block_) {  // the MTP block's KV row of `tok` too (and of the pending accepted drafts), as its own drafts
-        // would write it: the block attends to every position once it drafts again (without the row: stale memory)
-        const size_t E4 = mtp_hw() * 4;  // (h rows: Flash Next hc * E)
-        std::vector<int> toks = pend_toks_;
-        const int np = (int)toks.size();
-        if (np) CL_CHECK(clEnqueueCopyBuffer(cl_.queue, hpend_, hfin_, 0, 0, np * E4, 0, nullptr, nullptr));
-        CL_CHECK(clEnqueueCopyBuffer(cl_.queue, hlast_, hfin_, 0, np * E4, E4, 0, nullptr, nullptr));
-        toks.push_back(tok);
-        pend_toks_.clear();
-        mtp_rows(toks.data(), hfin_, np + 1, pos - np, false);
-      }
+      if (mtp_block_) mtp_sync_rows(tok);
       max_drafts = std::clamp(max_drafts, 1, std::clamp(opt.mtp_drafts, 1, std::min(kMaxDrafts, dfl_B_ - 1)));
       if (pos + 1 + max_drafts > ctx) max_drafts = std::max(1, ctx - pos - 1);
       return dflash_draft(tok, max_drafts);
@@ -733,12 +849,13 @@
     if (pos + 1 + max_drafts > ctx) max_drafts = std::max(1, ctx - pos - 1);
     std::vector<int> drafts;
     mtp_rows(toks.data(), hfin_, np + 1, pos - np, true, max_drafts > 1 ? mtp_h_ : nullptr);
-    const size_t nl = (size_t)hp.n_vocab;
+    // (ARC_MTP_VOCAB: the reduced head's N logits, row i the token draft_ids_[i])
+    const size_t nl = draft_head_on() ? (size_t)draft_head_.N : (size_t)hp.n_vocab;
     for (int k = 0;; ++k) {
       CL_CHECK(clEnqueueReadBuffer(cl_.queue, logits_, CL_TRUE, 0, nl * 4, mtp_logits_host_.data(), 0, nullptr, nullptr));
       const auto first = mtp_logits_host_.begin(), last = first + nl;
       const auto mx = std::max_element(first, last);
-      const int d = (int)(mx - first);
+      const int d = draft_head_on() ? draft_ids_[(size_t)(mx - first)] : (int)(mx - first);
       drafts.push_back(d);
       if ((int)drafts.size() >= max_drafts) break;
       const double z = softmax_den(&*first, nl, *mx);

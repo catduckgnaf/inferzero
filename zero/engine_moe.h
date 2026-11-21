@@ -52,7 +52,7 @@
     // router + shared expert gate/up (prompt chunks fuse silu(gate) * up into the up GEMM); one token: one GEMV
     // over the stacked rows when the layer has them (router logits at rgu_out_[0], gate / up in rgu_gu_)
     // (two passes: no fused epilogue; DeepSeek-V4.1: none either, its SwiGLU is clamped in swiglu_quant)
-    const int fused = cur_T_ > 8 && !q2mm_ && !hp.ds41 ? 1 : 0;
+    const int fused = cur_T_ > 8 && !q2mm_ && !h8_q2() && !hp.ds41 ? 1 : 0;  // (ARC_H8_Q2: two passes, no fused epilogue)
     cl_mem rl = rl_, gu = big_;
     if (g4) {
       // (done above)
@@ -162,8 +162,10 @@
       for (int i = 0; i < 3; ++i)
         rd_bytes += (uint64_t)(share * NU * (i == 2 ? E : F) * ((i == 2 ? F : E) / 256) * gguf_sb_bytes(L.ex_type[i]));
     }
-    static const int gr_gu = getenv("ARC_MOE_GR_GU") ? std::clamp(atoi(getenv("ARC_MOE_GR_GU")), 1, 8) : 1,
-                     gr_dn = getenv("ARC_MOE_GR_DN") ? std::clamp(atoi(getenv("ARC_MOE_GR_DN")), 1, 8) : 4;  // (rows per sub-group;
+    // (a Data Center GPU Max: 4 and 8 by default, see xehpc_on in zero/xe2/engine_xe2.h)
+    static const int gr_gu_e = getenv("ARC_MOE_GR_GU") ? std::clamp(atoi(getenv("ARC_MOE_GR_GU")), 1, 8) : 0,
+                     gr_dn_e = getenv("ARC_MOE_GR_DN") ? std::clamp(atoi(getenv("ARC_MOE_GR_DN")), 1, 8) : 0;
+    const int gr_gu = gr_gu_e ? gr_gu_e : xehpc_on() ? 4 : 1, gr_dn = gr_dn_e ? gr_dn_e : xehpc_on() ? 8 : 4;  // (rows per sub-group;
     // the down projection's 512-wide rows: 4 per sub-group in generation, 5.1 -> 4.0 ms per token, 1 for prompts)
     // standard experts, chunks of >= gemm_min tokens: decode + int8 GEMM (moe_gemm). Decoding all experts costs ~1 s
     // per chunk, so shorter chunks keep the per-tile kernels (Qwen3.6 35B: 1024 tokens 499 vs 490 tok/s, 2048 tokens
@@ -219,7 +221,8 @@
       const bool asct = asct_on && tm > 1 && !q2f;
       // (tried 2026-11-05: the tile's activations loaded once per step into local memory for the work-group's 16
       //  rows, two work-group barriers a step: bit-identical but gate / up 6.2 -> 9.6 s of a Flash Next 4K prompt)
-      cl_kernel k = kernel("decode", (q2f && tm > 1 ? std::string("-cl-intel-256-GRF-per-thread ") : grf_env("ARC_MOE_GRF")) +
+      static const std::string moe_grf_env = grf_env("ARC_MOE_GRF");  // (read once: every MoE layer of every token)
+      cl_kernel k = kernel("decode", (q2f && tm > 1 ? std::string("-cl-intel-256-GRF-per-thread ") : moe_grf_env) +
                                          "-DMOE_Q -DQT=" + std::to_string(L.ex_type[0]) + " -DGROWS=" +
                                          std::to_string(grows) + " -DTM=" + std::to_string(tm) + xdef + hld + q2fd +
                                          (asct ? " -DASCT" : "") + ds_swi_defs(), "moe_gateup_q");
@@ -297,14 +300,16 @@
       tl1.resize(1 + 3 * (size_t)NU);
       const bool xcpu = xcpu_layer_ok(L);
       if (xcpu)  // (with the CPU's inputs, one wait: zero/xe2/engine_xcpu.h)
-        xcpu_read_tiles(Mp, tl1);
+        xcpu_read_tiles(Mp, tl1, q2f && xcpu_q2());  // (two-pass mode: the residual's too, audit 2026-11-20 A2)
       else
         CL_CHECK(clEnqueueReadBuffer(cl_.queue, mtiles_, CL_TRUE, 0, tl1.size() * 4, tl1.data(), 0, nullptr, nullptr));
       xt_hit_h_.assign(1, 0);
       xt_miss_h_.assign(1, 0);
-      if (xcpu) {  // (the background fills that finished: cached from here on)
+      if (xcpu) {  // (the background fills of this layer from earlier tokens: cached from here on, xcache.h fill_commit_at)
         const auto tf = std::chrono::steady_clock::now();
-        xc_->fill_commit();
+        if (L.il <= xcpu_prev_il_) ++xcpu_tok_;  // (a layer at or below the last one: the next token)
+        xcpu_prev_il_ = L.il;
+        xc_->fill_commit_at(L.il, xcpu_tok_);
         xcpu_fill_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
       }
       for (int t = 0; t < tl1[0] && t < NU; ++t) {
@@ -359,11 +364,12 @@
     //      from run to run, ARC_XSPLIT=0 right; skipzx-lab). Here the finished row is copied into a GPU buffer,
     //      which the missed experts' kernels read instead: the same addresses, the same results bit for bit; one
     //      host wait more a split layer. ARC_XSPLIT_TAB=1: this; 2: only that wait (the row in host memory, a test);
-    //      0: as before. Default 1 on Alchemist (8-lane discrete cards), 0 elsewhere (Battlemage and the iGPUs gave
-    //      the right text)
+    //      0: as before. Default 1 on every GPU since 2026-11-21: first only on Alchemist, but a Panther Lake B390 under
+    //      Linux showed the same race (issue #74: Flash Next with a cold cache, KL against f32 0.88 mean / 10.3 max,
+    //      10 of 13 top tokens; with 1: 0.0075 / 0.026, 13 of 13, as ARC_XSPLIT=0). Nothing in it is Alchemist's: the
+    //      read is the same on every GPU. (Also no longer computed from the first engine's GPU for all of a split)
     if (tiles == xt_miss_ && xt_miss_) {
-      static const int xs_tab = getenv("ARC_XSPLIT_TAB") ? atoi(getenv("ARC_XSPLIT_TAB"))
-                                                         : (!zrt::integrated() && cl_.sg8 ? 1 : 0);
+      static const int xs_tab = getenv("ARC_XSPLIT_TAB") ? atoi(getenv("ARC_XSPLIT_TAB")) : 1;
       if (xs_tab == 1) {
         const size_t nb = (size_t)hp.n_expert * 8;
         if (!xt_tab_) xt_tab_ = buf(nb);
@@ -409,7 +415,7 @@
       size_t gws[2] = {(size_t)E, max_tiles}, lws[2] = {16, 1};
       run("moe_down", k, 2, gws, lws);
     }
-    if (!xmiss.empty()) xcpu_run(L, xmiss, Mp);  // (the CPU's slots copied into my_ ahead of moe_combine)
+    if (!xmiss.empty()) xcpu_run(L, xmiss, Mp, q2f && xcpu_q2());  // (ARC_XCPU_Q2=0: one pass on the CPU)  // (the CPU's slots copied into my_ ahead of moe_combine)
     if (tp_moe()) {
       tp_moe_combine(T);  // (this GPU's experts + the shared expert on GPU 0, summed over the GPUs)
     } else {
@@ -425,7 +431,7 @@
       const auto tf = std::chrono::steady_clock::now();
       std::vector<int> ids;
       for (auto& m : xmiss) ids.push_back(m.first);
-      xc_->fill(L.il, ids.data(), ids.size());
+      xc_->fill(L.il, ids.data(), ids.size(), xcpu_tok_);
       xcpu_fill_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
     }
     // (debug, ARC_DBG_MOE=layer: that layer's shared-expert output, its gate and the FFN output of the last row)
@@ -467,7 +473,7 @@
   // per-tile kernel 0.00000. iGPUs and 8-lane GPUs keep the per-tile kernel (slower there without 16-lane XMX: the
   // decode of every expert costs more than the GEMM saves). ARC_MOE_GEMM_PAD=0 / 1 force it
   bool moe_gemm_pad_on() const {
-    const char* e = getenv("ARC_MOE_GEMM_PAD");
+    static const char* e = getenv("ARC_MOE_GEMM_PAD");  // (read once: every MoE layer)
     const bool on = e ? atoi(e) != 0 : (!zrt::integrated() && xmx_ && !cl_.sg8);
     // (not Gemma 4 26B (704 padded to 768): its experts take GELU, which moe_gemm's fused epilogue lacks, and its two
     //  passes go to moe_rg anyway; audit 2026-11-17)
@@ -573,8 +579,11 @@
       // (ARC_MOE_CG / ARC_MOE_WY: sub-groups per work-group along the columns / the tiles, default 1 x 1; the same
       //  sums in the same order whatever the shape)
       // (at most 32 sub-groups per work-group: CG 1 / 2 / 4, WY up to 32 / CG; self audit 2026-11-08)
-      static const int mcg = getenv("ARC_MOE_CG") ? std::clamp(atoi(getenv("ARC_MOE_CG")), 1, 4) : 1,
-                       mwy = getenv("ARC_MOE_WY") ? std::clamp(atoi(getenv("ARC_MOE_WY")), 1, 32 / (mcg == 3 ? 2 : mcg)) : 1;
+      // (a Data Center GPU Max: CG 4 by default, see xehpc_on in zero/xe2/engine_xe2.h)
+      static const int mcg_e = getenv("ARC_MOE_CG") ? std::clamp(atoi(getenv("ARC_MOE_CG")), 1, 4) : 0;
+      const int mcg = mcg_e ? mcg_e : xehpc_on() ? 4 : 1;
+      static const int mwy_e = getenv("ARC_MOE_WY") ? std::max(1, atoi(getenv("ARC_MOE_WY"))) : 1;  // (read once)
+      const int mwy = std::min(mwy_e, 32 / (mcg == 3 ? 2 : mcg));
       const int cg = N % (16 * mcg) == 0 ? mcg : 1;
       const size_t ny = (std::max<size_t>(64, (size_t)cur_T_ * hp.n_expert_used / 16 / (NE / G) + G) + mwy - 1) / mwy * mwy;
       for (int e0 = 0; e0 < NE; e0 += G) {

@@ -116,6 +116,48 @@ struct Result {
   double seconds = 0;
 };
 
+// S8: the package GGUF at `path` against its source: a package, its kept tensors in order with the same names, types,
+// shapes and bytes, and the expert tensors listed as virtual. Throws on the first difference, naming it
+inline void verify_package(const GgufFile& src, const std::string& path, const std::vector<const GgufTensor*>& keep,
+                           const std::vector<std::string>& vnames) {
+  const auto t0 = std::chrono::steady_clock::now();
+  GgufFile pk(path);
+  auto bad = [&](const std::string& what) {
+    throw std::runtime_error("the package " + path + " came out wrong (" + what + "): not used; make it again, and if "
+                             "this repeats, put the models on another drive");
+  };
+  if (!pk.has("inferzero.package")) bad("no inferzero.package key");
+  if (pk.tensors.size() != keep.size() + vnames.size()) bad("its tensor count");
+  uint64_t bytes = 0;
+  // (both files' pieces copied out through copy_mapped first, S4: a page that cannot be read is read again, not the
+  //  end of the process; and the stall watch over the check, S1. The Researcher's review)
+  const size_t piece = 64ull << 20;
+  struct Buf { uint8_t* p; size_t n; ~Buf() { if (p) plat::page_free(p, n); } } ba{(uint8_t*)plat::page_alloc(piece), piece},
+      bb{(uint8_t*)plat::page_alloc(piece), piece};
+  if (!ba.p || !bb.p) throw std::runtime_error("out of memory checking the package");
+  BuildWatch watch("the package check", src.path, path);  // (path: the package's .tmp, removed if it hangs for good)
+  for (const GgufTensor* t : keep) {
+    const GgufTensor* p = pk.find(t->name);
+    if (!p || !p->data) bad("tensor " + t->name + " missing");
+    if (p->type != t->type || p->dims != t->dims || p->nbytes != t->nbytes) bad("tensor " + t->name + "'s type or shape");
+    XBuildStopGuard::check("the package check " + path);
+    for (uint64_t o = 0; o < t->nbytes; o += piece) {
+      const size_t n = (size_t)std::min<uint64_t>(piece, t->nbytes - o);
+      copy_mapped(src, ba.p, t->data + o, n, "the package check", "");
+      copy_mapped(pk, bb.p, p->data + o, n, "the package check", "");
+      if (memcmp(ba.p, bb.p, n) != 0) bad("tensor " + t->name + "'s bytes from " + std::to_string(o));
+      watch.tick();
+      XBuildStopGuard::check("the package check " + path);
+    }
+    plat::release_mapped(t->data, (size_t)t->nbytes);
+    bytes += t->nbytes;
+  }
+  for (const std::string& v : vnames)
+    if (!pk.find(v)) bad("expert tensor " + v + " not listed");
+  zlog::eprintf("inferzero: the package checked against its source: %zu tensors, %.2f GB the same, %.1f s\n", keep.size(),
+                bytes / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
 // Writes the package of `source` (the first part of a split model, or the only file) under packages_dir().
 inline Result make_package(const std::string& source, int n_layer_hint = 0) {
   namespace fs = std::filesystem;
@@ -169,6 +211,26 @@ inline Result make_package(const std::string& source, int n_layer_hint = 0) {
 #endif
           same = a == c;
         }
+        // (self audit 2026-11-20 A7: the source copied or moved since, D: -> C: for one: another path, the same model.
+        //  Taken as the same when the package's tensor table (every tensor's name, type and shape, by name: the package
+        //  lists its expert tensors, virtual, after the others) matches this file's; a model of the same name made
+        //  otherwise differs in its types or shapes)
+        if (!same) {
+          try {
+            GgufFile pk((fs::path(dir) / (name + ".gguf")).string());
+            same = pk.tensors.size() == src.tensors.size();
+            for (size_t i = 0; same && i < src.tensors.size(); ++i) {
+              const GgufTensor& s = src.tensors[i];
+              const GgufTensor* p = pk.find(s.name);
+              same = p && p->type == s.type && p->dims == s.dims;
+            }
+          } catch (const std::exception&) {
+            same = false;  // (an unreadable package: refused as before)
+          }
+          if (same)
+            zlog::eprintf("inferzero: %s was made from %s; this file (%s) has the same tensors: taken as the same model, "
+                          "moved or copied\n", dir.c_str(), prev.c_str(), now.string().c_str());
+        }
         if (!same)
           throw std::runtime_error("a package of the same name, made from another file, is already in " + dir +
                                    " (from " + prev + "; this one is " + now.string() +
@@ -218,7 +280,8 @@ inline Result make_package(const std::string& source, int n_layer_hint = 0) {
   const std::string tmp = r.gguf + ".tmp";
   auto drop_tmp = [&] { std::error_code e; fs::remove(tmp, e); };
   plat::KeepAwake awake;  // (S11)
-  drop_stale_tmp(tmp);    // (S7)
+  const plat::BuildLock lock(tmp + ".lock");  // (A9: until the package is complete or its .tmp removed)
+  drop_stale_tmp(tmp, lock);                  // (S7)
   {  // (S3: the package GGUF's room first; the expert file's is checked when it is written)
     uint64_t rest = 1ull << 20;
     for (const GgufTensor* t : keep) rest += (t->nbytes + align - 1) / align * align;
@@ -253,9 +316,36 @@ inline Result make_package(const std::string& source, int n_layer_hint = 0) {
       off += (t->nbytes + align - 1) / align * align;
     }
     w.pad(align);
-    for (const GgufTensor* t : keep) {
+    BuildWatch watch("the package", source, tmp);  // (S1: a drive that stops answering)
+    // (ARC_XBUILD_STALL_TEST=1: a test of S1, the build waits past the watch's limit once, as a drive that hangs)
+    if (getenv("ARC_XBUILD_STALL_TEST") && atoi(getenv("ARC_XBUILD_STALL_TEST")) == 1) {
+      const int lim = getenv("ARC_XBUILD_STALL_S") ? atoi(getenv("ARC_XBUILD_STALL_S")) : 60;
+      std::this_thread::sleep_for(std::chrono::seconds(lim + 2));
+    }
+    // S6 (2026-11-21): each piece copied out of the mapping into a buffer while the next one is prefetched in large
+    // requests (the pages read ahead, not faulted in one by one from fwrite), and the copy guarded (S4: a page that
+    // cannot be read is read again with read calls). The same bytes in the same order. ARC_XBUILD_PREFETCH=0: as before
+    static const bool s6 = !getenv("ARC_XBUILD_PREFETCH") || atoi(getenv("ARC_XBUILD_PREFETCH")) != 0;
+    const size_t piece = 64ull << 20;
+    struct Buf { uint8_t* p; size_t n; ~Buf() { if (p) plat::page_free(p, n); } } pbuf{s6 ? (uint8_t*)plat::page_alloc(piece) : nullptr, piece};
+    for (size_t ti = 0; ti < keep.size(); ++ti) {
+      const GgufTensor* t = keep[ti];
       XBuildStopGuard::check("the package " + tmp);
-      w.put(t->data, t->nbytes);
+      // (in pieces of 64 MB, each a tick: a 2 GB tensor from a slow USB disk takes longer than the watch's limit)
+      for (uint64_t o = 0; o < t->nbytes; o += piece) {
+        const size_t n = (size_t)std::min<uint64_t>(piece, t->nbytes - o);
+        if (pbuf.p) {
+          // (the next piece: of this tensor, else the next tensor's first)
+          if (o + piece < t->nbytes) plat::prefetch_mapped(t->data + o + piece, (size_t)std::min<uint64_t>(piece, t->nbytes - o - piece));
+          else if (ti + 1 < keep.size()) plat::prefetch_mapped(keep[ti + 1]->data, (size_t)std::min<uint64_t>(piece, keep[ti + 1]->nbytes));
+          copy_mapped(src, pbuf.p, t->data + o, n, "the package", "");
+          w.put(pbuf.p, n);
+        } else {
+          w.put(t->data + o, n);
+        }
+        watch.tick();
+        XBuildStopGuard::check("the package " + tmp);  // (S1: a stall seen meanwhile stops here)
+      }
       plat::release_mapped(t->data, (size_t)t->nbytes);  // (written: its pages leave the process on Linux; B6)
       w.pad(align);
     }
@@ -272,6 +362,17 @@ inline Result make_package(const std::string& source, int n_layer_hint = 0) {
     st.open_or_build(src, source, pre, n_exp, r.experts);
     if (!st.built) zlog::eprintf("inferzero: the expert file was already there: %s\n", r.experts.c_str());
     r.expert_bytes = st.file_bytes;
+  } catch (...) {
+    drop_tmp();
+    throw;
+  }
+  // S8 (2026-11-21): the package GGUF read back before it takes its name: its keys, its tensor table and every kept
+  // tensor's bytes against the source's. A package that differs is never put in place (a write that went wrong
+  // silently: a bad drive, a filesystem that dropped bytes). ARC_PACK_CHECK=0 skips it (it reads the kept tensors of
+  // both files once more)
+  try {
+    static const bool check = !getenv("ARC_PACK_CHECK") || atoi(getenv("ARC_PACK_CHECK")) != 0;
+    if (check) verify_package(src, tmp, keep, vnames);
   } catch (...) {
     drop_tmp();
     throw;

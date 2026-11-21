@@ -1,0 +1,7 @@
+<bos><|turn>system
+Kamu asisten yang ringkas.<turn|>
+<|turn>user
+Sebutkan 3 buah.<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

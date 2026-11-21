@@ -48,6 +48,25 @@ inline void quant_act32(const float* x, int8_t* q, float* sc, int K) {
     sc[b] = amax / 127.0f;
   }
 }
+// The same, and the rounding residual quantized the same way (moe_quant -DQ2M: v - q * (amax / 127), per 32 values)
+inline void quant_act32_q2(const float* x, int8_t* q, float* sc, int8_t* q2, float* sc2, int K) {
+  for (int b = 0; b < K / 32; ++b, x += 32, q += 32, q2 += 32) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[i]));
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f, s = amax / 127.0f;
+    float r[32], rmax = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+      const int qi = (int)std::nearbyint(x[i] * inv);
+      q[i] = (int8_t)qi;
+      r[i] = x[i] - (float)qi * s;
+      rmax = std::max(rmax, std::fabs(r[i]));
+    }
+    const float rinv = rmax > 0.0f ? 127.0f / rmax : 0.0f;
+    for (int i = 0; i < 32; ++i) q2[i] = (int8_t)(int)std::nearbyint(r[i] * rinv);
+    sc[b] = s;
+    sc2[b] = rmax / 127.0f;
+  }
+}
 
 #ifdef __AVX2__
 #define CPUX_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)

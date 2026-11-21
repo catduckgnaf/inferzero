@@ -1,0 +1,17 @@
+<bos><|turn>system
+<|think|>You are a coding agent.<|tool>declaration:read{description:<|"|>Read a file<|"|>,parameters:{properties:{lines:{,items:{type:<|"|>INTEGER<|"|>}type:<|"|>ARRAY<|"|>},mode:{enum:[<|"|>text<|"|>,<|"|>bytes<|"|>],type:<|"|>STRING<|"|>},offset:{type:<|"|>INTEGER<|"|>},path:{description:<|"|>File path<|"|>,type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:bash{description:<|"|>Run a shell command<|"|>,parameters:{properties:{command:{type:<|"|>STRING<|"|>},timeout:{nullable:true,type:<|"|>NUMBER<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Baca README.md<turn|>
+<|turn>model
+<|tool_call>call:read{offset:3,path:<|"|>README.md<|"|>}<tool_call|><turn|>
+<|turn>tool
+# Title
+text<turn|>
+<|turn>model
+<|tool_call>call:bash{command:<|"|>ls -la<|"|>}<tool_call|><|tool_call>call:read{lines:[1,2],path:<|"|>a.py<|"|>}<tool_call|>Let me also list files.<turn|>
+<|turn>tool
+a.py
+b.py<turn|>
+<|turn>tool
+print(1)<turn|>
+<|turn>model

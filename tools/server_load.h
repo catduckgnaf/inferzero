@@ -45,6 +45,10 @@ struct ServeOpts {
   // --gpus N: the model split over N GPUs (zero/mgpu): the server drives shard 0, its calls mirrored on the others.
   // Qwen3.5 / 3.6 / 3.8 text only for now: no MTP / DFlash2, images, saved prompts or sessions, warm-up
   int gpus = 1;
+  // --split layer (zero/mgpu/engine_pp.h): the GPUs as stages over ranges of the layers instead (--split tensor, the
+  // default: each layer's matrices split); --tensor-split a,b,...: GPU g's share of the layers (GPU 0: the last ones)
+  bool split_layer = false;
+  std::vector<double> shares;
 };
 // the engine a Loaded refers to: its own, or shard 0 of its TpEngine (which owns and frees it)
 struct EngineHold {
@@ -66,6 +70,7 @@ struct TpHold {
 };
 struct Loaded {  // destroyed in reverse order: the server before the tokenizer and engine it refers to
   std::unique_ptr<TpEngine, TpHold> tp;  // (--gpus: the split model, freed after everything that uses its shard 0)
+  std::unique_ptr<PpEngine> pp;  // (--split layer: the stages, freed after everything that uses the last one)
   std::unique_ptr<Engine, EngineHold> eng;
   std::unique_ptr<Tokenizer> tok;
   std::unique_ptr<Server> srv;
@@ -78,6 +83,15 @@ static std::unique_ptr<Loaded> load_model(const std::string& model, const std::s
   zlog::eprintf("inferzero-server: loading %s\n", model.c_str());
   const ServeOpts so_given = so;  // (failsafe: a split that cannot load loads on one GPU with these)
   if (so.gpus > 1) {  // (what a split model does not do yet: see ServeOpts::gpus)
+    // (said, not dropped silently: --mmproj was accepted with --gpus 2 and /props said vision: false with no line
+    //  why; catduckgnaf, issue #59)
+    if (!so.mmproj.empty() && so.mmproj != "-")
+      LOG_WRN("--gpus %d: images are not read with a split model yet; %s is not loaded (text only)\n", so.gpus,
+              so.mmproj.c_str());
+    if (so.eo.mtp || !so.eo.dflash.empty())
+      LOG_INF("--gpus %d: drafting (MTP / DFlash2) is off for a split model for now\n", so.gpus);
+    if (!so.split_layer && !so.shares.empty())
+      LOG_WRN("--tensor-split is for --split layer (each GPU's share of the layers); the tensor split ignores it\n");
     so.eo.mtp = false;
     so.eo.dflash.clear();
     so.dflash_auto = false;
@@ -115,6 +129,7 @@ static std::unique_ptr<Loaded> load_model(const std::string& model, const std::s
     if (gemma && (proj || !so.mmproj.empty())) eo.min_chunk = std::max(so.img_max, 2048);
   }
   AutoCtx used_ctx;  // (--ctx auto's count, for the log's memory line)
+  std::vector<double> pp_host_gb;  // (--split layer, --ctx auto: each stage's weights in host memory from its probe)
   bool have_ctx = false;
   if (so.ctx_auto) {
     const size_t enc = encoder_reserve(model, so.mmproj, so.img_max) + so.whisper_bytes;
@@ -123,8 +138,41 @@ static std::unique_ptr<Loaded> load_model(const std::string& model, const std::s
     //  not divide, the shared expert, ...): its weights, buffers and its share of the KV against GPU 0's memory. Before,
     //  it sized the whole model on one GPU, where a model bigger than one GPU got the 4096 floor. A model that cannot be
     //  split: the one-GPU probe, as the load then falls back to one GPU)
+    // (--split layer: every stage probed on its GPU with its layers; the context is the smallest that every stage
+    //  fits, resident only when every stage's weights are, each stage's host-memory weights its own)
+    auto probe_pp = [&](EngineOptions o) {
+      PpEngine::open(so.gpus);
+      const std::vector<int> c = PpEngine::cut(model, so.gpus, so.shares);
+      zrt::Dev* const saved = zrt::cur;
+      struct Back { zrt::Dev* s; ~Back() { zrt::cur = s; } } back{saved};
+      AutoCtx m;
+      pp_host_gb.assign(so.gpus, -1.0);
+      for (int r = 0; r < so.gpus; ++r) {
+        zrt::cur = zrt::devs[PpEngine::gpu_of(r, so.gpus)];
+        const AutoCtx s = auto_ctx(model, PpEngine::stage_options(o, c, r), so.budget_given, r + 1 == so.gpus ? enc : 0);
+        zlog::eprintf("--ctx auto: stage %d (GPU %d, layers %d-%d): %d tokens\n", r, PpEngine::gpu_of(r, so.gpus), c[r],
+                      c[r + 1] - 1, s.ctx);
+        if (s.host_gb > 0) pp_host_gb[r] = s.host_gb;
+        if (r == 0 || s.ctx < m.ctx) {
+          const bool res = r == 0 ? s.resident : m.resident && s.resident;
+          m = s;
+          m.resident = res;
+        } else {
+          m.resident = m.resident && s.resident;
+        }
+      }
+      m.host_gb = 0;  // (each stage's own: pp_host_gb)
+      return m;
+    };
     auto probe = [&](EngineOptions o) {
-      if (so.gpus > 1) {
+      if (so.gpus > 1 && so.split_layer) {
+        try {
+          return probe_pp(o);
+        } catch (const std::exception& e) {
+          LOG_WRN("--ctx auto: the layer split over %d GPUs could not be sized (%s): sized as on one GPU\n", so.gpus, e.what());
+          pp_host_gb.clear();
+        }
+      } else if (so.gpus > 1) {
         EngineOptions s = o;
         s.tp_size = so.gpus, s.tp_rank = 0;
         try {
@@ -165,15 +213,22 @@ static std::unique_ptr<Loaded> load_model(const std::string& model, const std::s
     // (failsafe: a model that cannot be split (Gemma 4 for transcripts) or a split that fails to load
     //  (memory, the GPUs' layouts) loads on one GPU instead, with every feature, rather than failing the server)
     try {
-      L->tp.reset(new TpEngine(model, eo, so.gpus));
+      if (so.split_layer) L->pp.reset(new PpEngine(model, eo, so.gpus, so.shares, pp_host_gb));
+      else L->tp.reset(new TpEngine(model, eo, so.gpus));
     } catch (const std::exception& e) {
       zlog::eprintf("multi-GPU: %s; loading %s on one GPU instead\n", e.what(), alias.c_str());
       ServeOpts one = so_given;
       one.gpus = 1;
+      one.split_layer = false;
       return load_model(model, alias, one);
     }
-    L->tp->serve();
-    L->eng = std::unique_ptr<Engine, EngineHold>(&L->tp->shard(0), EngineHold{false});
+    if (L->pp) {  // (the last stage, on GPU 0, is the server's engine: zero/mgpu/engine_pp.h)
+      L->pp->serve();
+      L->eng = std::unique_ptr<Engine, EngineHold>(&L->pp->last(), EngineHold{false});
+    } else {
+      L->tp->serve();
+      L->eng = std::unique_ptr<Engine, EngineHold>(&L->tp->shard(0), EngineHold{false});
+    }
   } else {
     L->eng = std::unique_ptr<Engine, EngineHold>(new Engine(model, eo));
   }
@@ -181,8 +236,23 @@ static std::unique_ptr<Loaded> load_model(const std::string& model, const std::s
   L->tok = std::make_unique<Tokenizer>(eng.gguf());
   zlog::eprintf("loaded in %.1f s | %d layers | ctx %d%s | chunk %d | GPU %.2f GiB%s | weights %s\n", eng.load_ms / 1000,
           eng.hp.n_layer, eng.ctx, eng.slot_count() > 1 ? (" in each of " + std::to_string(eng.slot_count()) + " slots").c_str() : "",
-          eng.max_chunk, eng.gpu_bytes / 1073741824.0, so.gpus > 1 ? (" on each of " + std::to_string(so.gpus) + " GPUs").c_str() : "",
+          eng.max_chunk, eng.gpu_bytes / 1073741824.0, L->pp ? (" on GPU 0, the last of " + std::to_string(so.gpus) + " stages").c_str() : so.gpus > 1 ? (" on each of " + std::to_string(so.gpus) + " GPUs").c_str() : "",
           eng.w8_resident ? "W8 resident" : "W8 just-in-time");
+  // (a context given with --ctx, not auto: the same check as runz's, Engine::fits_share, which counts drafting's
+  //  memory as plain's. Before 2026-11-21 the server checked nothing here, and a --ctx past the card's share paged
+  //  without a word: a 16 GB A770's 27B at 92K with --mtp, 11 tok/s, issue #45. It warns; the context stays the one
+  //  asked for)
+  if (!so.ctx_auto && so.gpus <= 1 && !eng.fits_share()) {
+    const double GiB = 1073741824.0;
+    const int fit = eng.max_fitting_ctx();
+    LOG_WRN("does not fit: %.2f GiB of GPU memory for a context of %d%s%s, over the %.2f GiB share less %.1f for the "
+            "driver; expect paging and far lower speeds (%s)\n",
+            eng.gpu_bytes / GiB, eng.ctx, eo.mtp ? " with drafting" : "",
+            eng.host_weight_bytes() ? (", " + std::to_string((int)(eng.host_weight_bytes() / 1048576)) + " MiB of the weights in host memory too").c_str() : "",
+            eng.device_mem() / GiB, Engine::driver_slack() / GiB,
+            fit > 0 ? ("--ctx " + std::to_string(fit) + " (every weight on the GPU) or --ctx auto fits").c_str()
+                    : "no context fits: a smaller model, or --ctx auto");
+  }
   try {  // (the log's model and memory lines, docs/logging.md; /metrics' model_info: never a reason the load fails)
     const auto& h = eng.hp;
     // (general.file_type as llama.cpp names it: the main quant; a mixed file such as UD-Q4_K_XL says its base)

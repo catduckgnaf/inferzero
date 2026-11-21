@@ -8,7 +8,10 @@
 // and reused otherwise; it can be deleted at any time.
 #pragma once
 #include <atomic>
+#include <condition_variable>
 #include <csignal>
+#include <filesystem>
+#include <thread>
 #include "../src/app_dir.h"
 #include "../src/gguf.h"
 #include "../src/autoround_revision.h"
@@ -37,14 +40,22 @@ extern "C" inline void xbuild_on_signal(int sig) { g_xbuild_sig.store(sig); }
 // A .tmp left by a build that was killed (power cut, SIGKILL, a crash): as large as the file it was to become. Removed
 // with a line saying so before a new build writes it again (it was truncated silently before, its space taken until
 // then; S7).
-inline void drop_stale_tmp(const std::string& tmp) {
+// (self audit 2026-11-20 A9: the caller holds `lock`, a plat::BuildLock on tmp + ".lock", for the whole build: a .tmp
+//  another process is still writing has its lock held, and this one stops with a message instead of removing it; the
+//  line says a removal only when one happened)
+inline void drop_stale_tmp(const std::string& tmp, const plat::BuildLock& lock) {
+  if (!lock.held())
+    throw std::runtime_error("another inferzero is writing " + tmp + " now: wait for it to finish, or stop it");
   std::error_code e;
   const auto st = std::filesystem::status(std::filesystem::path(tmp), e);
   if (e || !std::filesystem::is_regular_file(st)) return;
   const uintmax_t n = std::filesystem::file_size(std::filesystem::path(tmp), e);
-  zlog::eprintf("inferzero: removing %s (%.1f GB) left by an earlier build that did not finish\n", tmp.c_str(),
-                e ? 0.0 : n / 1e9);
-  std::filesystem::remove(std::filesystem::path(tmp), e);
+  const double gb = e ? 0.0 : n / 1e9;
+  if (std::filesystem::remove(std::filesystem::path(tmp), e) && !e)
+    zlog::eprintf("inferzero: removed %s (%.1f GB) left by an earlier build that did not finish\n", tmp.c_str(), gb);
+  else
+    zlog::eprintf("inferzero: could not remove %s (%.1f GB) left by an earlier build: %s\n", tmp.c_str(), gb,
+                  e.message().c_str());
 }
 // Refuses to start writing `bytes` next to `path` when its drive has less free (plus 256 MB of room): a full disk
 // stopped a build after tens of minutes, with the numbers nowhere (S3). A drive whose free space cannot be read: no
@@ -61,33 +72,143 @@ inline void need_free_space(const std::string& path, uint64_t bytes, const char*
     throw std::runtime_error(std::string(what) + " " + path + msg + "free some space, or put the models on another drive");
   }
 }
-struct XBuildStopGuard {
-  void (*old_int)(int) = SIG_DFL;
-  void (*old_term)(int) = SIG_DFL;
-  XBuildStopGuard() {
-    old_int = std::signal(SIGINT, xbuild_on_signal);
-    old_term = std::signal(SIGTERM, xbuild_on_signal);
+// (self audit 2026-11-20 A8: guards counted, not told apart by the handler they replaced, so two builds on two threads
+//  (a pack beside a load) no longer restore each other's handlers out of order; the first installs, the last restores
+//  and hands the signal on. A signal the process ignored (SIG_IGN, e.g. nohup's SIGINT) stays ignored: a build is not
+//  stopped by it)
+// S1 (2026-11-21, QUEUE "pack and expert-file failsafes"): a stall watchdog for the builds that read a whole source
+// GGUF (the expert file, a package). A drive that hangs under the build's reads (D: did, on 2026-11-19) blocks the
+// read itself, a page fault in a mapping or a read call, so no flag checked between batches is reached. A thread
+// waits for the build's ticks: none for ARC_XBUILD_STALL_S seconds (60; 0 off) means the drive has stopped answering.
+// It says which drive and sets g_xbuild_stall, which the build's next check (XBuildStopGuard::check) turns into an
+// error: that load fails and the server stays up. A read that never returns gets there never, so after 3x the limit
+// it removes the .tmp if it can and ends the process with code 4 (a hang that never ends is worse; the Researcher's
+// review: a stall must not take a server's open chats along when the build can still stop by itself). A .tmp left
+// behind is removed at the next start (S7).
+inline std::atomic<bool> g_xbuild_stall{false};
+struct BuildWatch {
+  std::atomic<uint64_t> beats{0};
+  std::mutex m;
+  std::condition_variable cv;
+  bool done = false;
+  std::thread th;
+  BuildWatch(const std::string& what, const std::string& source, const std::string& tmp) {
+    static const int lim = getenv("ARC_XBUILD_STALL_S") ? atoi(getenv("ARC_XBUILD_STALL_S")) : 60;
+    if (lim <= 0) return;
+    g_xbuild_stall.store(false);
+    th = std::thread([this, what, source, tmp] {
+      uint64_t last = beats.load();
+      auto since = std::chrono::steady_clock::now();
+      bool said = false;
+      const std::string drive = std::filesystem::path(source).root_name().string();
+      const char* dname = drive.empty() ? source.c_str() : drive.c_str();
+      std::unique_lock<std::mutex> lk(m);
+      while (!done) {
+        cv.wait_for(lk, std::chrono::seconds(1));
+        if (done) break;
+        const uint64_t b = beats.load();
+        if (b != last) {
+          last = b;
+          since = std::chrono::steady_clock::now();
+          continue;
+        }
+        const auto idle = std::chrono::steady_clock::now() - since;
+        if (!said && idle >= std::chrono::seconds(lim)) {
+          said = true;
+          LOG_ERR("inferzero: writing %s: no data read from %s for %d s (%s). The drive has stopped answering; some "
+                  "drives hang under this many random reads. Stopping; copy the model to an internal SSD and start "
+                  "again (ARC_XBUILD_STALL_S=N waits N seconds, 0 forever)\n", what.c_str(), dname, lim, source.c_str());
+          g_xbuild_stall.store(true);  // (the build's next check throws: XBuildStopGuard::check)
+        }
+        if (idle < std::chrono::seconds(3 * lim)) continue;
+        LOG_ERR("inferzero: the read from %s has not returned for %d s: ending the process (code 4)\n", dname, 3 * lim);
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);  // (it may still be open: then the next start removes it, S7)
+        fflush(nullptr);
+        std::_Exit(4);
+      }
+    });
   }
-  ~XBuildStopGuard() {
-    std::signal(SIGINT, old_int == SIG_ERR ? SIG_DFL : old_int);
-    std::signal(SIGTERM, old_term == SIG_ERR ? SIG_DFL : old_term);
-    // (the outermost guard hands the signal on, once the .tmp files are gone: an inner one would only set the flag
-    //  again through the outer guard's handler)
-    if (old_int != xbuild_on_signal && old_term != xbuild_on_signal) {
-      const int sig = g_xbuild_sig.exchange(0);
-      if (sig) std::raise(sig);
+  void tick() { beats.fetch_add(1, std::memory_order_relaxed); }
+  ~BuildWatch() {
+    {
+      std::lock_guard<std::mutex> g(m);
+      done = true;
     }
-  }
-  static void check(const std::string& what) {
-    if (g_xbuild_sig.load())
-      throw std::runtime_error("stopped by " + std::string(g_xbuild_sig.load() == SIGTERM ? "SIGTERM" : "Ctrl+C / SIGINT") +
-                               " while writing " + what + ": its .tmp removed, the next start begins it again");
+    cv.notify_all();
+    if (th.joinable()) th.join();
   }
 };
+
+struct XBuildStopGuard {
+  static std::mutex& mu() { static std::mutex m; return m; }
+  static inline int depth = 0;
+  static inline void (*old_int)(int) = SIG_DFL;
+  static inline void (*old_term)(int) = SIG_DFL;
+  static void (*take(int sig))(int) {
+    void (*old)(int) = std::signal(sig, xbuild_on_signal);
+    if (old == SIG_IGN) std::signal(sig, SIG_IGN);  // (kept ignored)
+    return old;
+  }
+  XBuildStopGuard() {
+    std::lock_guard<std::mutex> g(mu());
+    if (depth++ == 0) {
+      old_int = take(SIGINT);
+      old_term = take(SIGTERM);
+    }
+  }
+  ~XBuildStopGuard() {
+    std::lock_guard<std::mutex> g(mu());
+    if (--depth > 0) return;
+    // (the last guard restores the handlers and hands the signal on, once the .tmp files are gone)
+    std::signal(SIGINT, old_int == SIG_ERR ? SIG_DFL : old_int);
+    std::signal(SIGTERM, old_term == SIG_ERR ? SIG_DFL : old_term);
+    const int sig = g_xbuild_sig.exchange(0);
+    if (sig) std::raise(sig);
+  }
+  // (resumable: the expert file, whose .tmp is kept after a finished layer and taken up again at the next start, S2)
+  static void check(const std::string& what, bool resumable = false) {
+    if (g_xbuild_stall.load())  // (S1: BuildWatch saw no data for its limit)
+      throw std::runtime_error("the source drive stopped answering while writing " + what +
+                               ": copy the model to an internal SSD and start again");
+    if (g_xbuild_sig.load())
+      throw std::runtime_error("stopped by " + std::string(g_xbuild_sig.load() == SIGTERM ? "SIGTERM" : "Ctrl+C / SIGINT") +
+                               " while writing " + what +
+                               (resumable ? ": the next start goes on from its last finished layer"
+                                          : ": its .tmp removed, the next start begins it again"));
+  }
+};
+
+// S4 (2026-11-21): bytes of a model out of its mapping, for the expert file's batches and the package's tensors; a
+// page that cannot be read (an in-page error, SIGBUS) ended the process before. Now the same bytes are read again with
+// read calls, up to 3 tries a second apart, each said in the log; then the build fails with the file and offset. Bit
+// for bit the same bytes (ARC_XBUILD_TEST_FAULT=N: the first N copies act as if they failed, for tests)
+inline void copy_mapped(const GgufFile& f, void* dst, const uint8_t* src, size_t n, const char* what, const char* kept) {
+  static std::atomic<int> test_fault{getenv("ARC_XBUILD_TEST_FAULT") ? atoi(getenv("ARC_XBUILD_TEST_FAULT")) : 0};
+  if (test_fault.load() <= 0 && plat::guarded_copy(dst, src, n)) return;
+  if (test_fault.load() > 0) test_fault.fetch_sub(1);
+  std::string file;
+  uint64_t off = 0;
+  if (!f.locate(src, n, file, off))
+    throw std::runtime_error(std::string("a page of the model could not be read while writing ") + what);
+  for (int t = 1; t <= 3; ++t) {
+    zlog::eprintf("inferzero: a page of %s at %.2f GB could not be read through the mapping: reading it again (try %d "
+                  "of 3)\n", file.c_str(), off / 1e9, t);
+    if (plat::read_file_at(file, off, dst, n)) return;
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+  throw std::runtime_error("cannot read " + file + " at byte " + std::to_string(off) + " (" + std::to_string(n) +
+                           " bytes) while writing " + what + ": the drive or the file is damaged; copy the model again, "
+                           "then start again" + kept);
+}
 
 struct ExpertStore {
   struct LayerInfo {
     uint32_t type[3] = {};  // gate, up, down GGUF types
+    // (the 4 bytes the alignment of part[] puts here, a field so they are written as zeros: the header is memcpy'd
+    //  to the file, and they were left unset, so the same model gave different expert files (B3, 2026-11-21). The
+    //  layout and size are as before: files written before read the same)
+    uint32_t pad = 0;
     uint64_t part[3] = {};  // bytes of each matrix of one expert (GPU raw form)
     uint64_t rec = 0;       // bytes of one expert record (multiple of 4096)
     uint64_t off = 0;       // file offset of the layer's expert 0
@@ -99,6 +220,7 @@ struct ExpertStore {
       return rec == other.rec && off == other.off;
     }
   };
+  static_assert(sizeof(LayerInfo) == 56, "the expert file's layer entry: 56 bytes, as files already written");
   std::vector<LayerInfo> layers;  // by layer index; rec == 0: not a MoE layer
   int n_expert = 0;
   std::string path;
@@ -175,6 +297,12 @@ struct ExpertStore {
       const fs::path full = fs::absolute(fs::path(gguf_path), e2);
       std::ofstream src_txt(own_dir / "source.txt", std::ios::binary | std::ios::trunc);
       src_txt << (e2 ? gguf_path : full.string()) << "\r\n";
+      src_txt.flush();
+      // (B5, 2026-11-21: checked. The expert file is fine without it; only the cleanup of orphaned folders reads it)
+      if (!src_txt)
+        LOG_WRN("inferzero: could not write %s (a full disk or no permission): the expert file is fine, but this "
+                "folder will not be recognized as belonging to its GGUF when cleaning up\n",
+                (own_dir / "source.txt").string().c_str());
     }
     note_orphans();
     return path;
@@ -197,7 +325,25 @@ struct ExpertStore {
       if (!in || !std::getline(in, src)) continue;
       while (!src.empty() && (src.back() == '\r' || src.back() == '\n')) src.pop_back();
       const fs::path sp(src);
-      if (src.empty() || fs::exists(sp, e2) || !fs::exists(sp.root_path(), e2)) continue;
+      if (!src.empty() && fs::exists(sp, e2)) {
+        // (S2's kept build of a model that is not loaded again: its .tmp, tens of GB, stays until that model loads.
+        //  Named after ARC_XTMP_DAYS (7) days without a write; the Researcher's review, 2026-11-21)
+        static const double days = getenv("ARC_XTMP_DAYS") ? atof(getenv("ARC_XTMP_DAYS")) : 7.0;
+        for (const auto& f : fs::directory_iterator(d.path(), e2)) {
+          std::error_code e3;
+          const std::string n = f.path().filename().string();
+          if (n.size() < 17 || n.compare(n.size() - 17, 17, ".experts.tmp.done") != 0) continue;
+          const auto age = fs::file_time_type::clock::now() - fs::last_write_time(f.path(), e3);
+          const double d_old = std::chrono::duration<double>(age).count() / 86400.0;
+          const fs::path tmp = f.path().parent_path() / n.substr(0, n.size() - 5);
+          if (e3 || d_old < days || !fs::exists(tmp, e3)) continue;
+          zlog::eprintf("inferzero: %s (%.1f GB) is an expert file's build stopped %.0f days ago: it goes on when %s "
+                        "loads again; delete it and %s to free the space\n", tmp.string().c_str(),
+                        fs::file_size(tmp, e3) / 1e9, d_old, src.c_str(), f.path().filename().string().c_str());
+        }
+        continue;
+      }
+      if (src.empty() || !fs::exists(sp.root_path(), e2)) continue;
       uint64_t bytes = 0;
       for (const auto& f : fs::directory_iterator(d.path(), e2)) {
         std::error_code e3;
@@ -291,6 +437,11 @@ struct ExpertStore {
         throw std::runtime_error("the package's expert file is missing or does not match: " + path +
                                  " (make the package again from the original GGUF: serverz --pack <gguf>)");
       build(f, prefixes, fp);
+      static const bool after = getenv("ARC_XBUILD_VERIFY") && atoi(getenv("ARC_XBUILD_VERIFY")) != 0;
+      if (after) check_sums(true);  // (S12: the file just written, read back)
+    } else {
+      static const bool on_load = getenv("ARC_EXPERTS_CHECK") && atoi(getenv("ARC_EXPERTS_CHECK")) != 0;
+      if (on_load) check_sums(false);
     }
     for (int i = 0; i < 2 * kQD; ++i) slots_[i].id = i;  // (before the open: no path reads with ids unset)
     const int op = af_.open(path.c_str(), 2 * kQD);  // (unbuffered, reads in flight: src/platform.h AsyncFile)
@@ -312,7 +463,26 @@ struct ExpertStore {
       ram_n_ = layers.size() * (size_t)n_expert;
       ram_rec_.reset(new std::atomic<char*>[ram_n_]);
       for (size_t i = 0; i < ram_n_; ++i) ram_rec_[i].store(nullptr, std::memory_order_relaxed);
+      ram_resv_.assign(ram_n_, nullptr);
     }
+  }
+  // The tier's records for layer l's experts es, taken now on the caller's thread for reads a prefetch thread does
+  // next (read() with keep = false then fills these and takes no others). Which records enter the tier then depends
+  // only on the order of the calls, not on two threads' timing near the cap: ARC_XCPU, whose choice of experts
+  // follows the tier, gives the same results run to run (2026-11-21). A record not read leaves its slot pending.
+  void reserve(int l, const std::vector<int>& es) {
+    if (!ram_rec_ || l < 0 || (size_t)l >= layers.size()) return;
+    for (int e : es) {
+      if (e < 0 || e >= n_expert) continue;
+      const size_t key = (size_t)l * n_expert + e;
+      std::atomic<char*>& slot = ram_rec_[key];
+      if (slot.load(std::memory_order_acquire)) continue;  // (there, or being read)
+      if (char* home = ram_take(slot, layers[l].rec)) ram_resv_[key] = home;
+    }
+  }
+  uint64_t ram_capacity() const {  // (the tier's size; 0: none)
+    std::lock_guard<std::mutex> g(ram_mu_);
+    return ram_rec_ ? ram_cap_ : 0;
   }
   uint64_t ram_bytes() const {  // (the prefetch thread adds to it: read under its lock)
     std::lock_guard<std::mutex> g(ram_mu_);
@@ -330,7 +500,9 @@ struct ExpertStore {
   // sets of read slots (0: the caller's thread, 1: the expert cache's prefetch thread; two threads may read at once).
   // src (out): where the record is now, for the GPU copy: dst, or its place in the RAM tier (to_dst: always dst)
   struct Req { int layer, expert; void* dst; const void* src = nullptr; };
-  void read(std::vector<Req>& reqs, int set = 0, bool to_dst = false) {
+  // keep: records read from the SSD may enter the tier (false: the expert cache's fill at load, ARC_XRAM_FILL=0, so
+  // the tier holds what the GPU's cache does not; tier hits are still taken)
+  void read(std::vector<Req>& reqs, int set = 0, bool to_dst = false, bool keep = true) {
     Slot* slots = slots_ + (set ? kQD : 0);
     if (!ram_rec_) {
       read_ssd(reqs, slots);
@@ -344,7 +516,8 @@ struct ExpertStore {
     todo.clear(), at.clear();
     for (size_t i = 0; i < reqs.size(); ++i) {
       Req& r = reqs[i];
-      std::atomic<char*>& slot = ram_rec_[(size_t)r.layer * n_expert + r.expert];
+      const size_t key = (size_t)r.layer * n_expert + r.expert;
+      std::atomic<char*>& slot = ram_rec_[key];
       char* m = slot.load(std::memory_order_acquire);
       if (m && m != kPending) {
         r.src = m;
@@ -352,7 +525,10 @@ struct ExpertStore {
         if (to_dst) memcpy(r.dst, m, layers[r.layer].rec), r.src = r.dst;
         continue;
       }
-      char* home = m ? nullptr : ram_take(slot, layers[r.layer].rec);
+      // (a record reserve() set aside for this read: read into it and published below)
+      char* home = nullptr;
+      if (m == kPending && ram_resv_[key]) home = ram_resv_[key], ram_resv_[key] = nullptr;
+      else if (!m && keep) home = ram_take(slot, layers[r.layer].rec);
       todo.push_back({r.layer, r.expert, home ? home : r.dst});
       at.push_back(i);
     }
@@ -397,6 +573,9 @@ struct ExpertStore {
     return r;
   }
   std::unique_ptr<std::atomic<char*>[]> ram_rec_;  // (layer * n_expert + expert -> its record in RAM, kPending, null)
+  // (key -> the record reserve() set aside, until read() claims it: written before the prefetch thread starts, then
+  //  only by that thread for its own keys)
+  std::vector<char*> ram_resv_;
   size_t ram_n_ = 0;
   uint64_t ram_cap_ = 0, ram_used_ = 0, ram_left_ = 0;
   char* ram_next_ = nullptr;
@@ -466,7 +645,9 @@ struct ExpertStore {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
     Header h{};
-    const bool ok = fread(&h, sizeof h, 1, f) == 1 && h.magic == kMagic && h.version == kVersion && (any_fp || h.fingerprint == fp) &&
+    // (version 1, the only one: the layers' checksums (S12) sit in the padding after the layer table, kSumsMagic)
+    const bool ok = fread(&h, sizeof h, 1, f) == 1 && h.magic == kMagic && h.version == kVersion &&
+                    (any_fp || h.fingerprint == fp) &&
                     h.layers == layers.size() && h.experts == (uint64_t)n_expert && h.bytes == file_bytes;
     bool same = ok;
     for (size_t l = 0; same && l < layers.size(); ++l) {
@@ -477,50 +658,210 @@ struct ExpertStore {
     if (ok && package) check_autoround_expert_revision(*package, h.fingerprint);
     return same;
   }
+  // ---- S12 (2026-11-21): a checksum of each layer's bytes, in the header after the layer table (the room the layout
+  // already keeps: 80 bytes a layer, 56 used), marked by kSumsMagic there. The header's version stays 1 (it is also
+  // part of the fingerprint): releases before this one read such a file as before, the padding they never look at
+  // (a version 2 header, the first form, made them rebuild it: the Researcher's review), and files without sums are
+  // read as before here
+  static constexpr uint32_t kSumsMagic = 0x534D5553;  // "SUMS", then 4 zero bytes, then the sums
+  static uint64_t sum_bytes(uint64_t h, const uint8_t* p, size_t n) {  // (n a multiple of 8: records are 4 KB multiples)
+    for (size_t i = 0; i + 8 <= n; i += 8) {
+      uint64_t w;
+      memcpy(&w, p + i, 8);
+      h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+      h ^= h >> 29;
+    }
+    return h;
+  }
+  size_t sums_at() const { return sizeof(Header) + layers.size() * sizeof(LayerInfo); }
+  // the file's layers read back against the sums its header holds; just_built: say so either way. A version 1 file
+  // has none: a line, nothing checked
+  void check_sums(bool just_built) const {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return;
+    struct Close { FILE* f; ~Close() { fclose(f); } } cf{f};
+    uint32_t mark[2] = {0, 0};
+    if (fseek(f, (long)sums_at(), SEEK_SET) != 0 || fread(mark, 4, 2, f) != 2 || mark[0] != kSumsMagic) {
+      zlog::eprintf("inferzero: %s has no layer checksums (written before 2026-11-21): not checked\n", path.c_str());
+      return;
+    }
+    std::vector<uint64_t> want(layers.size());
+    if (fread(want.data(), 8, want.size(), f) != want.size()) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<uint8_t> b(64u << 20);
+    size_t n_ok = 0;
+    for (size_t l = 0; l < layers.size(); ++l) {
+      const LayerInfo& L = layers[l];
+      if (!L.rec) continue;
+#ifdef _WIN32
+      if (_fseeki64(f, (long long)L.off, SEEK_SET) != 0) return;
+#else
+      if (fseeko(f, (off_t)L.off, SEEK_SET) != 0) return;
+#endif
+      uint64_t s = 0, left = L.rec * (uint64_t)n_expert;
+      while (left) {
+        const size_t c = (size_t)std::min<uint64_t>(left, b.size());
+        if (fread(b.data(), 1, c, f) != c) throw std::runtime_error("cannot read " + path + " (layer " + std::to_string(l) + ")");
+        s = sum_bytes(s, b.data(), c);
+        left -= c;
+      }
+      if (s != want[l])
+        throw std::runtime_error("the expert file " + path + " is damaged: layer " + std::to_string(l) +
+                                 " is not what was written (delete it: the next load writes it again)");
+      ++n_ok;
+    }
+    zlog::eprintf("inferzero: %s%s: %zu layers checked, all as written (%.1f s)\n", path.c_str(),
+                  just_built ? " read back" : "", n_ok, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+  }
+  // S2: where a stopped build of this file goes on. rs holds {kResumeMagic, 1, fp, file_bytes, layers, next layer,
+  // its offset}; the .tmp must be at least that long and begin with this build's header (hb, `first` bytes)
+  static constexpr uint32_t kResumeMagic = 0x31535258;  // "XRS1"
+  struct Resume { uint32_t magic, version; uint64_t fp, bytes, layers, next, off; };
+  bool resume_point(const std::string& tmp, const std::string& rs, uint64_t fp, const uint8_t* hb, uint64_t first,
+                    size_t& next, uint64_t& off) const {
+    static const bool on = !getenv("ARC_XBUILD_RESUME") || atoi(getenv("ARC_XBUILD_RESUME")) != 0;
+    if (!on) return false;
+    Resume r{};
+    {
+      FILE* f = fopen(rs.c_str(), "rb");
+      if (!f) return false;
+      const bool got = fread(&r, sizeof r, 1, f) == 1;
+      fclose(f);
+      if (!got) return false;
+    }
+    if (r.magic != kResumeMagic || r.version != 1 || r.fp != fp || r.bytes != file_bytes || r.layers != layers.size() ||
+        r.next > layers.size() || r.off < first || r.off > file_bytes || r.off % kAlign)
+      return false;
+    // (the next layer with experts starts at r.off; past the last one, r.off is the file's end)
+    size_t n = (size_t)r.next;
+    while (n < layers.size() && !layers[n].rec) ++n;
+    if (n < layers.size() ? layers[n].off != r.off : r.off != file_bytes) return false;
+    std::error_code e;
+    const uintmax_t have = std::filesystem::file_size(std::filesystem::path(tmp), e);
+    if (e || have < r.off) return false;
+    std::vector<uint8_t> h((size_t)first);
+    FILE* f = fopen(tmp.c_str(), "rb");
+    if (!f) return false;
+    const bool same = fread(h.data(), 1, h.size(), f) == h.size() && memcmp(h.data(), hb, h.size()) == 0;
+    fclose(f);
+    if (!same) return false;
+    next = n;
+    off = r.off;
+    return true;
+  }
+  static void write_resume(const std::string& rs, uint64_t fp, uint64_t bytes, uint64_t nlayers, size_t next, uint64_t off) {
+    const Resume r{kResumeMagic, 1, fp, bytes, nlayers, (uint64_t)next, off};
+    const std::string t = rs + ".new";
+    FILE* f = fopen(t.c_str(), "wb");
+    if (!f) return;  // (no record: a stop then begins again from zero, as before S2)
+    const bool ok = fwrite(&r, sizeof r, 1, f) == 1 && fflush(f) == 0;
+    fclose(f);
+    if (!ok || !plat::replace_file(t.c_str(), rs.c_str())) plat::remove_file(t.c_str());
+  }
+  static void copy_source(const GgufFile& f, void* dst, const uint8_t* src, size_t n) {
+    copy_mapped(f, dst, src, n, "the expert file", " (the finished layers are kept)");
+  }
   void build(const GgufFile& f, const std::vector<std::string>& prefixes, uint64_t fp) {
     XBuildStopGuard stop_guard;  // (before the .tmp's owner: it unwinds after the .tmp is removed; D1)
     const auto t0 = std::chrono::steady_clock::now();
     zlog::eprintf("inferzero: writing the expert file %s (%.1f GB, once per model)\n", path.c_str(), file_bytes / 1e9);
-    const std::string tmp = path + ".tmp";
+    const std::string tmp = path + ".tmp", rs = tmp + ".done";
     plat::KeepAwake awake;  // (S11: a laptop left alone slept mid-build)
-    drop_stale_tmp(tmp);    // (S7)
-    need_free_space(path, file_bytes, "the expert file");  // (S3: before anything is written)
-    // unbuffered writes (4 KB multiples from page-aligned buffers): 15 GB through the Windows file cache filled the
-    // RAM (3.9 GB left, paging) on the 32 GB laptop
-    // (the .tmp file goes away if the build fails half way: it is as large as the expert file)
-    // (src/platform.h DirectWriter: unbuffered, write-through; Linux O_DIRECT)
-    struct Tmp {
-      plat::DirectWriter w;
-      std::string path;
-      bool done = false;
-      ~Tmp() {
-        w.close();
-        if (!done) plat::remove_file(path.c_str());
-      }
-    } out{{}, tmp};
-    if (!out.w.open(tmp.c_str())) {
-      out.done = true;
-      throw std::runtime_error("cannot write " + tmp);
-    }
-    auto put = [&](const void* p, uint64_t n) {
-      if (!out.w.write(p, n)) throw std::runtime_error("write failed: " + tmp);
-    };
-    // header (+ layer table), padded to the first layer's offset
+    const plat::BuildLock lock(tmp + ".lock");  // (A9: held until the .tmp is renamed or removed below)
+    if (!lock.held())
+      throw std::runtime_error("another inferzero is writing " + tmp + " now: wait for it to finish, or stop it");
+    // the header (+ layer table), padded to the first layer's offset
+    uint64_t first = kAlign;
+    for (auto& L : layers) if (L.rec) { first = L.off; break; }
+    uint8_t* hb = (uint8_t*)plat::page_alloc(first);  // (zeroed: the header's padding)
+    if (!hb) throw std::runtime_error("out of memory writing the expert file");
+    struct Free { void* p; size_t n; ~Free() { plat::page_free(p, n); } } free_hb{hb, (size_t)first};
     {
-      uint64_t first = kAlign;
-      for (auto& L : layers) if (L.rec) { first = L.off; break; }
-      uint8_t* hb = (uint8_t*)plat::page_alloc(first);  // (zeroed: the header's padding)
-      if (!hb) throw std::runtime_error("out of memory writing the expert file");
       Header h{kMagic, kVersion, fp, layers.size(), (uint64_t)n_expert, file_bytes};
       memcpy(hb, &h, sizeof h);
       memcpy(hb + sizeof h, layers.data(), layers.size() * sizeof(LayerInfo));
-      struct Free { void* p; size_t n; ~Free() { plat::page_free(p, n); } } free_hb{hb, (size_t)first};
-      put(hb, first);
     }
+    // S2 (2026-11-21): a build stopped after some layers (Ctrl+C, SIGTERM, a power cut, a full disk) goes on from the
+    // next layer: after each layer the .tmp is synced and `rs` says where the next one starts. Taken up only when
+    // `rs` names this build (fingerprint, size, layers) and the .tmp's header is this build's, byte for byte; the
+    // same bytes are written either way, so the file is the same. Anything else: the .tmp removed as before (S7)
+    size_t start_l = 0;
+    uint64_t pos = 0;
+    const bool resume = resume_point(tmp, rs, fp, hb, first, start_l, pos);
+    if (!resume) {
+      plat::remove_file(rs.c_str());
+      drop_stale_tmp(tmp, lock);  // (S7)
+    }
+    need_free_space(path, file_bytes - pos, "the expert file");  // (S3: before anything is written)
+    BuildWatch watch("the expert file", f.path, tmp);            // (S1: a drive that stops answering)
+    // unbuffered writes (4 KB multiples from page-aligned buffers): 15 GB through the Windows file cache filled the
+    // RAM (3.9 GB left, paging) on the 32 GB laptop
+    // (the .tmp file goes away if the build fails before its first layer is done; after it, it is kept for S2)
+    // (src/platform.h DirectWriter: unbuffered, write-through; Linux O_DIRECT)
+    struct Tmp {
+      plat::DirectWriter w;
+      std::string path, rs;
+      bool done = false, keep = false;
+      ~Tmp() {
+        w.close();
+        if (done) return;
+        if (keep) {
+          std::error_code e;
+          const double gb = std::filesystem::file_size(path, e) / 1e9;
+          zlog::eprintf("%sinferzero: kept %s (%.1f GB) with its finished layers: the next start of this model goes on "
+                        "from there; not loading it again? delete it and its .done file\n",
+                        loadp::st().on ? "" : "\n", path.c_str(), e ? 0.0 : gb);  // (the tools' layer counter is a \r line)
+          return;
+        }
+        plat::remove_file(path.c_str());
+        plat::remove_file(rs.c_str());
+      }
+    } out{{}, tmp, rs};
+    // (S12: each layer's checksum; a resumed build's earlier layers read back from the .tmp first, before it is opened
+    //  for writing, which Windows opens without sharing)
+    std::vector<uint64_t> sums(layers.size(), 0);
+    const bool sums_fit = sums_at() + 8 + 8 * layers.size() <= first;
+    if (resume && sums_fit) {
+      FILE* rf = fopen(tmp.c_str(), "rb");
+      if (!rf) throw std::runtime_error("cannot read " + tmp);
+      struct Close { FILE* f; ~Close() { fclose(f); } } crf{rf};
+      std::vector<uint8_t> b(64u << 20);
+      for (size_t l = 0; l < start_l; ++l) {
+        const LayerInfo& L = layers[l];
+        if (!L.rec) continue;
+#ifdef _WIN32
+        if (_fseeki64(rf, (long long)L.off, SEEK_SET) != 0) throw std::runtime_error("cannot read " + tmp);
+#else
+        if (fseeko(rf, (off_t)L.off, SEEK_SET) != 0) throw std::runtime_error("cannot read " + tmp);
+#endif
+        for (uint64_t left = L.rec * (uint64_t)n_expert; left;) {
+          const size_t c = (size_t)std::min<uint64_t>(left, b.size());
+          if (fread(b.data(), 1, c, rf) != c) throw std::runtime_error("cannot read " + tmp);
+          sums[l] = sum_bytes(sums[l], b.data(), c);
+          left -= c;
+        }
+      }
+    }
+    if (!(resume ? out.w.open_at(tmp.c_str(), pos) : out.w.open(tmp.c_str()))) {
+      out.done = true;
+      throw std::runtime_error("cannot write " + tmp);
+    }
+    out.keep = resume;
+    auto put = [&](const void* p, uint64_t n) {
+      if (!out.w.write(p, n)) throw std::runtime_error("write failed: " + tmp);
+      pos += n;
+    };
+    if (!resume) put(hb, first);
     const int G = 32;  // experts converted per batch (in parallel)
     size_t n_done = 0, n_all = 0;  // (layers with experts: the progress)
-    for (const std::string& p : prefixes) n_all += !p.empty();
     for (size_t l = 0; l < prefixes.size(); ++l) {
+      n_all += !prefixes[l].empty();
+      n_done += !prefixes[l].empty() && l < start_l;
+    }
+    if (resume)
+      zlog::eprintf("inferzero: going on with %s from layer %zu / %zu (%.1f of %.1f GB written before)\n", tmp.c_str(),
+                    n_done + 1, n_all, pos / 1e9, file_bytes / 1e9);
+    for (size_t l = start_l; l < prefixes.size(); ++l) {
       if (prefixes[l].empty()) continue;
       const LayerInfo& L = layers[l];
       Src m[3];
@@ -591,7 +932,7 @@ struct ExpertStore {
       if (pool_on && !pb.p) zlog::eprintf("inferzero: no %.0f MB for the expert file's read buffer: reading in place\n", pool_n / 1e6);
       if (pool) prefetch_batch(0);
       for (int e0 = 0; e0 < n_expert; e0 += G) {
-        XBuildStopGuard::check("the expert file " + path);
+        XBuildStopGuard::check("the expert file " + path, out.keep);
         const int ne = std::min(G, n_expert - e0);
         memset(buf, 0, (size_t)ne * L.rec);
         // where matrix i's rows are read from: the mapping from row 0, or this batch's copy from row lo_row[i]
@@ -601,7 +942,7 @@ struct ExpertStore {
           for (int k = 0; k < n_sp; ++k) {
             uint64_t lo, hi;
             span_rows(k, e0, ne, lo, hi);
-            memcpy(pb.p + sp[k].at, sp[k].t->data + lo * sp[k].rowb, (size_t)((hi - lo) * sp[k].rowb));
+            copy_source(f, pb.p + sp[k].at, sp[k].t->data + lo * sp[k].rowb, (size_t)((hi - lo) * sp[k].rowb));
             // (copied: on Linux those pages leave the process now, not at the end of the pass; B6)
             plat::release_mapped(sp[k].t->data + lo * sp[k].rowb, (size_t)((hi - lo) * sp[k].rowb));
             for (int i = 0; i < 3; ++i)
@@ -635,18 +976,41 @@ struct ExpertStore {
           }
         }
         put(buf, (uint64_t)ne * L.rec);
+        sums[l] = sum_bytes(sums[l], buf, (size_t)ne * L.rec);  // (S12)
+        watch.tick();
       }
       // the layer's GGUF pages leave the working set (they stay in the standby list, which Windows can reuse)
       plat::trim_working_set();
+      // (S2: the layer on the drive, then the place the next one starts)
+      if (!out.w.sync()) throw std::runtime_error("write failed: " + tmp);
+      write_resume(rs, fp, file_bytes, layers.size(), l + 1, pos);
+      out.keep = true;
       ++n_done;
+      // (tests: ARC_XBUILD_TEST_STOP=N stops after N finished layers of this build as Ctrl+C would)
+      static const int test_stop = getenv("ARC_XBUILD_TEST_STOP") ? atoi(getenv("ARC_XBUILD_TEST_STOP")) : 0;
+      if (test_stop > 0 && !resume && n_done == (size_t)test_stop) g_xbuild_sig.store(SIGINT);
       if (loadp::st().on) loadp::step("writing the expert file (once per model)", (double)n_done, (double)n_all);
       else zlog::eprintf("\r  layer %zu / %zu", n_done, n_all);  // (the command-line tools: their own line)
     }
     if (!loadp::st().on) zlog::eprintf("\n");
     out.w.close();
+    if (pos != file_bytes)  // (every layer written: the offsets the layer table gives, end to end)
+      throw std::runtime_error("the expert file " + tmp + " came out " + std::to_string(pos) + " bytes, not " +
+                               std::to_string(file_bytes));
+    // (S12: the header's block once more, with kSumsMagic and the layers' checksums after the layer table; where they
+    //  don't fit, as before)
+    if (sums_fit) {
+      const uint32_t mark[2] = {kSumsMagic, 0};
+      memcpy(hb + sums_at(), mark, 8);
+      memcpy(hb + sums_at() + 8, sums.data(), 8 * sums.size());
+      if (!out.w.open_at(tmp.c_str(), 0) || !out.w.write(hb, first) || !out.w.sync())
+        throw std::runtime_error("write failed: " + tmp);
+      out.w.close();
+    }
     if (!plat::replace_file(tmp.c_str(), path.c_str()))  // (an old file of the same name: replaced)
       throw std::runtime_error("cannot rename " + tmp + " (" + std::to_string(plat::last_error()) + ")");
     out.done = true;
+    plat::remove_file(rs.c_str());
     build_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     built = true;
   }

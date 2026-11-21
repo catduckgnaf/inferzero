@@ -69,8 +69,9 @@
 #ifndef XW_WGX
 #define XW_WGX 1
 #endif
-#if XW_WGX != 1 && XW_WGX != 2 && XW_WGX != 4
-#error "XW_WGX must be 1, 2 or 4"
+// (8: only with -DXW_SLM, its work-groups of up to 32 sub-groups; 2026-11-21, ocloc dg2-g10: 32 x 32 8 x 4 no spill)
+#if XW_WGX != 1 && XW_WGX != 2 && XW_WGX != 4 && !(XW_WGX == 8 && defined(XW_SLM))
+#error "XW_WGX must be 1, 2 or 4 (8 with XW_SLM)"
 #endif
 #define XW_TG (XW_TM / 8)   // DPAS row groups of 8 tokens
 #define XW_NH (2 * XW_NC)   // DPAS column blocks of 8
@@ -134,7 +135,247 @@ __kernel void gemm_xw8(__global const uint* restrict wq, __global const uint* re
 #pragma unroll
     for (int h = 0; h < XW_NH; ++h) xacc[t][h] = (int8)(0);
 
-#if defined(XW_PACKA) || defined(XW_PACKW)
+#if defined(XW_SLM)
+  // ---- -DXW_SLM (2026-11-21, opt-in; the A770 plan: its H8 GEMMs at ~28 % of the measured XMX peak, where the 140T's
+  //      loop reached 85 % with its operands already in L1, xw_peak --probe, issue #5: the operands arrive late). The
+  //      work-group's packed chunk (its XW_WGY x XW_TG token groups' A, its XW_WGX x XW_NC column groups' B) is copied
+  //      to local memory by all its sub-groups together, one 64-word block read each unit, and double-buffered: the next
+  //      chunk's global reads are issued before this chunk's DPAS and stored after them, one barrier a chunk. Each
+  //      sub-group's DPAS then read their operands from local memory. Every byte of A and B is read from L2 once per
+  //      work-group, not once per sub-group. The local copy is the global layout word for word, so the same words reach
+  //      the same DPAS in the same order: bit for bit the plain loop's (integer sums, the one epilogue).
+  //      The host gives an explicit local size (8 * XW_WGX, XW_WGY): get_local_size(1) must be XW_WGY.
+#if !defined(XW_PACKA) || !defined(XW_PACKW) || !defined(XW_WGY)
+#error "XW_SLM needs XW_PACKA, XW_PACKW and XW_WGY"
+#endif
+#ifdef XW_GU
+#error "XW_SLM is not for the fused gate + up GEMM"
+#endif
+#define XS_AW (XW_WGY * XW_TG * 128)  // words of A a chunk (token group t's: 2 halves x 64 words)
+#define XS_BW (XW_WGX * XW_NC * 256)  // words of B a chunk (column group c's: lo0, lo1, hi0, hi1 x 64 words)
+#define XS_UA (XS_AW / 64)
+#define XS_U ((XS_AW + XS_BW) / 64)   // 64-word units a chunk
+#define XS_NS (XW_WGX * XW_WGY)       // sub-groups a work-group
+// -DXS_CPS=2 / 4 (2026-11-21, ARC_GEMM_XW_SLM_CPS): that many 64-value chunks a stage, one barrier a stage instead of
+// a chunk; the chunks' DPAS run in their order, so the sums are the same. A piece's chunks are whole superblocks (4
+// chunks each), so CPS 1, 2 or 4 always divides them: no partial stage. Local memory 2 x CPS x a chunk (DG2: 64 KB)
+#ifndef XS_CPS
+#define XS_CPS 1
+#endif
+#if XS_CPS != 1 && XS_CPS != 2 && XS_CPS != 4
+#error "XS_CPS must be 1, 2 or 4"
+#endif
+#define XS_UPS ((XS_U * XS_CPS + XS_NS - 1) / XS_NS)  // (a stage's units a sub-group: v = sid + i * XS_NS)
+  __local uint xs[2][XS_CPS][XS_AW + XS_BW];
+  const int nch = K / 64, lane = (int)get_sub_group_local_id();
+  const int sy = (int)get_local_id(1), sid = sy * XW_WGX + sx;
+  // (the work-group's first token group and column group: this sub-group's are tg0 + sy * XW_TG and cg0 + sx * XW_NC)
+  __global const uint* apw = (__global const uint*)aq + (size_t)(row * XW_WGY * XW_TG) * nch * 128;
+  __global const uint* wpw = wq + (size_t)(cb * XW_WGX * XW_NC) * nsb * 4 * 256;
+  const int ch0 = s_begin * 4, ch1 = s_end * 4;
+  int8 st[XS_UPS];
+  // unit u of chunk ch: A (u < XS_UA) of the work-group's token group u / 2, half u % 2; B of its column group
+  // (u - XS_UA) / 4, part (u - XS_UA) % 4; in local memory at u * 64 either way
+#define XS_SRC(u, ch)                                                                         \
+  ((u) < XS_UA ? apw + ((size_t)((u) >> 1) * nch + (ch)) * 128 + ((u) & 1) * 64             \
+               : wpw + ((size_t)(((u) - XS_UA) >> 2) * nsb * 4 + (ch)) * 256 + (((u) - XS_UA) & 3) * 64)
+#define XS_LOAD(ch)                                                                          \
+  _Pragma("unroll") for (int i = 0; i < XS_UPS; ++i) {                                        \
+    const int v = sid + i * XS_NS;  /* (unit v of the stage: chunk v / XS_U, its unit v % XS_U) */ \
+    if (v < XS_U * XS_CPS) st[i] = as_int8(intel_sub_group_block_read8(XS_SRC(v % XS_U, (ch) + v / XS_U))); \
+  }
+#define XS_STORE(b)                                                                          \
+  _Pragma("unroll") for (int i = 0; i < XS_UPS; ++i) {                                        \
+    const int v = sid + i * XS_NS;                                                            \
+    if (v < XS_U * XS_CPS) {                                                                  \
+      XS_WR(xs[b][v / XS_U] + (v % XS_U) * 64, st[i]);                                        \
+    }                                                                                         \
+  }
+#ifdef XS_SCALAR  // (the local reads and writes a word a lane: for a driver without cl_intel_subgroup_local_block_io)
+#define XS_RD(p) as_int8((uint8)((p)[lane], (p)[8 + lane], (p)[16 + lane], (p)[24 + lane], (p)[32 + lane], \
+                                 (p)[40 + lane], (p)[48 + lane], (p)[56 + lane]))
+#define XS_WR(p, x)                                                                                         \
+  {                                                                                                         \
+    __local uint* d_ = (p) + lane;                                                                          \
+    const uint8 v_ = as_uint8(x);                                                                           \
+    d_[0] = v_.s0, d_[8] = v_.s1, d_[16] = v_.s2, d_[24] = v_.s3, d_[32] = v_.s4, d_[40] = v_.s5;           \
+    d_[48] = v_.s6, d_[56] = v_.s7;                                                                         \
+  }
+#else  // (one block message each: component w of lane l = word 8 w + l, as the global block reads)
+#define XS_RD(p) as_int8(intel_sub_group_block_read8((__local const uint*)(p)))
+#define XS_WR(p, x) intel_sub_group_block_write8((__local uint*)(p), as_uint8(x))
+#endif
+#ifdef XW_PTR
+  // -DXW_PTR (ARC_GEMM_XW_PTR, 2026-11-21, opt-in; the kernel-loop audit, docs/xe2-tuning.md 16): the copy's
+  // addresses set once. ocloc dg2-g10 counted the big tile's loop at 410 instructions for 33 DPAS, most of them
+  // XS_SRC's 64-bit address rebuilt from the chunk index for every unit, and the units' `v < XS_U * XS_CPS` tests in
+  // branches. Here each of this sub-group's units gets its source at the first stage, its step a stage (A's chunks 128
+  // words apart, B's 256) and its place in local memory before the loop; a stage adds the step. Where the units divide
+  // evenly over the sub-groups (the default 32 x 32 with 4 x 4 sub-groups: 64 units, 16 sub-groups) every unit is
+  // real and the test goes. The same words from the same addresses to the same places: bit for bit XW_SLM's results
+  // (the offsets in words from apw / wpw, 32 bits: a work-group's A and B are well under 2^32 words. Whether unit i is
+  //  A or B is fixed at build time where the sub-groups divide both A's units and all units (XS_FIX: the defaults),
+  //  so its base is a constant there and one flag a unit otherwise)
+#define XS_ALL ((XS_U * XS_CPS) % XS_NS == 0)
+#define XS_FIX (XS_ALL && XS_U % XS_NS == 0 && XS_UA % XS_NS == 0)
+#define XS_IS_A(i) (XS_FIX ? ((i) * XS_NS) % XS_U < XS_UA : xs_a[i])
+  uint xs_off[XS_UPS];
+  int xs_dst[XS_UPS];
+  bool xs_a[XS_UPS];
+#pragma unroll
+  for (int i = 0; i < XS_UPS; ++i) {
+    const int v = sid + i * XS_NS, u = v % XS_U, j = v / XS_U, c = ch0 + j;
+    xs_a[i] = u < XS_UA;  // (a unit past the stage's end, v >= XS_U * XS_CPS, is never read)
+    xs_off[i] = xs_a[i] ? (uint)(((u >> 1) * nch + c) * 128 + (u & 1) * 64)
+                        : (uint)((((u - XS_UA) >> 2) * nsb * 4 + c) * 256 + ((u - XS_UA) & 3) * 64);
+    xs_dst[i] = j * (XS_AW + XS_BW) + u * 64;
+  }
+#undef XS_LOAD
+#undef XS_STORE
+#define XS_LOAD(ch)                                                                          \
+  _Pragma("unroll") for (int i = 0; i < XS_UPS; ++i) {                                        \
+    if (XS_ALL || sid + i * XS_NS < XS_U * XS_CPS)                                            \
+      st[i] = as_int8(intel_sub_group_block_read8((XS_IS_A(i) ? apw : wpw) + xs_off[i]));     \
+    xs_off[i] += (XS_IS_A(i) ? 128u : 256u) * XS_CPS;                                         \
+  }
+#define XS_STORE(b)                                                                          \
+  _Pragma("unroll") for (int i = 0; i < XS_UPS; ++i) {                                        \
+    if (XS_ALL || sid + i * XS_NS < XS_U * XS_CPS) XS_WR(&xs[b][0][0] + xs_dst[i], st[i]);   \
+  }
+#endif
+  if (ch0 < ch1) {  // (s_begin / s_end are the same for the whole work-group: its barriers stay uniform)
+    XS_LOAD(ch0)
+    XS_STORE(0)
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  for (int ch = ch0; ch < ch1; ch += XS_CPS) {  // (a stage of XS_CPS chunks)
+    const int cur = ((ch - ch0) / XS_CPS) & 1;
+    const bool more = ch + XS_CPS < ch1;
+    if (more) { XS_LOAD(ch + XS_CPS) }
+#pragma unroll
+    for (int j = 0; j < XS_CPS; ++j) {  // (the stage's chunks in order: the same sums as one chunk a stage)
+      __local const uint* xa = xs[cur][j] + sy * XW_TG * 128;
+      __local const uint* xb = xs[cur][j] + XS_AW + sx * XW_NC * 256;
+      int8 lo0[XW_NC], lo1[XW_NC], hi0[XW_NC], hi1[XW_NC];
+#pragma unroll
+      for (int c = 0; c < XW_NC; ++c) {
+        lo0[c] = XS_RD(xb + c * 256), lo1[c] = XS_RD(xb + c * 256 + 64);
+        hi0[c] = XS_RD(xb + c * 256 + 128), hi1[c] = XS_RD(xb + c * 256 + 192);
+      }
+#pragma unroll
+      for (int t = 0; t < XW_TG; ++t) {
+        const int8 a0 = XS_RD(xa + t * 128), a1 = XS_RD(xa + t * 128 + 64);
+#pragma unroll
+        for (int c = 0; c < XW_NC; ++c) {
+          xacc[t][2 * c] = xw8_mad(a1, hi0[c], xw8_mad(a0, lo0[c], xacc[t][2 * c]));
+          xacc[t][2 * c + 1] = xw8_mad(a1, hi1[c], xw8_mad(a0, lo1[c], xacc[t][2 * c + 1]));
+        }
+      }
+    }
+    if (more) { XS_STORE(cur ^ 1) }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+#elif defined(XW_DB) && defined(XW_PACKA) && defined(XW_PACKW)
+  // ---- -DXW_DB (ARC_GEMM_XW_DB, 2026-11-20, the A770 row's G3; the Alchemist default for 32-token tiles since 2026-11-21): the packed loop with its loads one step ahead. The
+  //      next token group's A operands are read before this group's DPAS, and at a chunk's last group the next chunk's B
+  //      operands too, so a load's latency is covered by the DPAS before it is needed (the plain loop waits on each
+  //      read where it is used). The same operands reach the same DPAS in the same order: bit for bit the plain loop's.
+  //      Registers: one token group's A (2 x 8 words a lane) and one chunk's B (4 x 8 x XW_NC) more than the plain loop.
+  const int nch = K / 64;
+  __global const uint* apk = (__global const uint*)aq + (size_t)(m0 / 8) * nch * 128;
+  const int ch0 = s_begin * 4, ch1 = s_end * 4;
+  //      -DXW_DB2 (ARC_GEMM_XW_DB=2, 2026-11-21, opt-in): the next chunk's B into the same registers, column group c's
+  //      right after c's last DPAS of the chunk, and the chunk loop unrolled by 4 as the plain loop is. ocloc dg2-g10 at
+  //      256 registers: the form above spills when unrolled (16 x 32: 5,952 bytes at 2, 5,696 at 4), this one does not
+  //      (76 DPAS at 16 x 32, as the plain loop's 65 + its 4 chunks); the same DPAS in the same order, bit for bit.
+#ifdef XW_DB2
+  int8 lo0[XW_NC], lo1[XW_NC], hi0[XW_NC], hi1[XW_NC];
+#else
+  int8 lo0[XW_NC], lo1[XW_NC], hi0[XW_NC], hi1[XW_NC], nlo0[XW_NC], nlo1[XW_NC], nhi0[XW_NC], nhi1[XW_NC];
+#endif
+  int8 na0 = (int8)(0), na1 = (int8)(0);
+  if (ch0 < ch1) {
+#pragma unroll
+    for (int c = 0; c < XW_NC; ++c) {
+      __global const uint* dp = wq + ((size_t)(g0 + c) * nsb * 4 + ch0) * (16 * LS);
+      lo0[c] = as_int8(intel_sub_group_block_read8(dp));
+      lo1[c] = as_int8(intel_sub_group_block_read8(dp + 64));
+      hi0[c] = as_int8(intel_sub_group_block_read8(dp + 128));
+      hi1[c] = as_int8(intel_sub_group_block_read8(dp + 192));
+    }
+    __global const uint* tp = apk + (size_t)ch0 * 128;
+    na0 = as_int8(intel_sub_group_block_read8(tp));
+    na1 = as_int8(intel_sub_group_block_read8(tp + 64));
+  }
+#ifdef XW_DB2
+#pragma unroll 4
+#endif
+  for (int ch = ch0; ch < ch1; ++ch) {
+    XW_ARRIVE();
+#if XW_PF
+    {
+      const int qn = ch + XW_PFD, lane = (int)get_sub_group_local_id();
+      if (qn < ch1) {
+#if XW_PF & 1
+#pragma unroll
+        for (int c = 0; c < XW_NC; ++c) prefetch(wq + ((size_t)(g0 + c) * nsb * 4 + qn) * (16 * LS) + lane * 32, 32);
+#endif
+#if XW_PF & 2
+#pragma unroll
+        for (int t = 0; t < XW_TG; ++t)
+          if (t % XW_WGX == sx) prefetch(apk + ((size_t)t * nch + qn) * 128 + lane * 16, 16);
+#endif
+      }
+    }
+#endif
+    const bool more = ch + 1 < ch1;  // (uniform over the sub-group)
+#pragma unroll
+    for (int t = 0; t < XW_TG; ++t) {
+      const int8 a0 = na0, a1 = na1;
+      // (the next A: token group t + 1 of this chunk, or group 0 of the next chunk)
+      if (t + 1 < XW_TG) {
+        __global const uint* tp = apk + ((size_t)(t + 1) * nch + ch) * 128;
+        na0 = as_int8(intel_sub_group_block_read8(tp));
+        na1 = as_int8(intel_sub_group_block_read8(tp + 64));
+      } else if (more) {
+        __global const uint* tp = apk + (size_t)(ch + 1) * 128;
+        na0 = as_int8(intel_sub_group_block_read8(tp));
+        na1 = as_int8(intel_sub_group_block_read8(tp + 64));
+#ifndef XW_DB2
+#pragma unroll
+        for (int c = 0; c < XW_NC; ++c) {  // (and the next chunk's B)
+          __global const uint* dp = wq + ((size_t)(g0 + c) * nsb * 4 + ch + 1) * (16 * LS);
+          nlo0[c] = as_int8(intel_sub_group_block_read8(dp));
+          nlo1[c] = as_int8(intel_sub_group_block_read8(dp + 64));
+          nhi0[c] = as_int8(intel_sub_group_block_read8(dp + 128));
+          nhi1[c] = as_int8(intel_sub_group_block_read8(dp + 192));
+        }
+#endif
+      }
+#pragma unroll
+      for (int c = 0; c < XW_NC; ++c) {
+        xacc[t][2 * c] = xw8_mad(a1, hi0[c], xw8_mad(a0, lo0[c], xacc[t][2 * c]));
+        xacc[t][2 * c + 1] = xw8_mad(a1, hi1[c], xw8_mad(a0, lo1[c], xacc[t][2 * c + 1]));
+#ifdef XW_DB2
+        if (t + 1 == XW_TG && more) {  // (the next chunk's B for column group c, in place)
+          __global const uint* dp = wq + ((size_t)(g0 + c) * nsb * 4 + ch + 1) * (16 * LS);
+          lo0[c] = as_int8(intel_sub_group_block_read8(dp));
+          lo1[c] = as_int8(intel_sub_group_block_read8(dp + 64));
+          hi0[c] = as_int8(intel_sub_group_block_read8(dp + 128));
+          hi1[c] = as_int8(intel_sub_group_block_read8(dp + 192));
+        }
+#endif
+      }
+    }
+#ifndef XW_DB2
+    if (more) {
+#pragma unroll
+      for (int c = 0; c < XW_NC; ++c) lo0[c] = nlo0[c], lo1[c] = nlo1[c], hi0[c] = nhi0[c], hi1[c] = nhi1[c];
+    }
+#endif
+    XW_WAIT();
+  }
+#elif defined(XW_PACKA) || defined(XW_PACKW)
   // (the packed layouts: a column group's 4 B operands, then each token group's 2 A operands)
   const int nch = K / 64;
   __global const uint* apk = (__global const uint*)aq + (size_t)(m0 / 8) * nch * 128;
@@ -256,6 +497,73 @@ __kernel void gemm_xw8(__global const uint* restrict wq, __global const uint* re
 #pragma unroll
   for (int v = 0; v < XW_TM / SG; ++v)
     av[v] = as_float(intel_sub_group_block_read((__global const uint*)(asc + m0 + SG * v)));
+#ifdef XW_EPI2
+  // -DXW_EPI2 (2026-11-21, opt-in; the A770 plan): the same values a row at a time. A sub-group's XW_NH column blocks
+  // of a row are one run of 8 * XW_NH floats (column g0 * 16 + 8 h + lane), so a row's C is read and written in one
+  // block message of XW_NH words instead of XW_NH messages of 32 bytes spread over the tile, and the accumulate mode
+  // is decided once, not per value. On an A770 the 32 x 32 tiles lost most on up + SwiGLU (xw_peak, skipzx-lab, #45:
+  // 12.67 ms against 7.19 for gate; at 32 x 16 8.13 against 6.67). Every value gets the same operations in the same
+  // order (scale x column scale x sum, then + C or the SwiGLU): bit for bit the epilogue below.
+#if XW_NH == 2
+#define EPI_T uint2
+#define EPI_RD(p) intel_sub_group_block_read2(p)
+#define EPI_WR(p, v) intel_sub_group_block_write2((p), (v))
+#elif XW_NH == 4
+#define EPI_T uint4
+#define EPI_RD(p) intel_sub_group_block_read4(p)
+#define EPI_WR(p, v) intel_sub_group_block_write4((p), (v))
+#else
+#define EPI_T uint8
+#define EPI_RD(p) intel_sub_group_block_read8(p)
+#define EPI_WR(p, v) intel_sub_group_block_write8((p), (v))
+#endif
+  float dc[XW_NH];
+#pragma unroll
+  for (int h = 0; h < XW_NH; ++h)
+    dc[h] = as_float(intel_sub_group_block_read(wh + (size_t)(g0 + h / 2) * LS + (h & 1) * SG));
+#define EPI_ROWS(MODE)                                                                                     \
+  _Pragma("unroll") for (int t = 0; t < XW_TG; ++t) {                                                      \
+    _Pragma("unroll") for (int r = 0; r < 8; ++r) {                                                        \
+      const float as = BCAST(av[t], r);                                                                    \
+      __global uint* cp = (__global uint*)(C + c_off + (size_t)(m0 + 8 * t + r) * ldc + (size_t)g0 * LS); \
+      EPI_T o;                                                                                             \
+      uint* ow = (uint*)&o;                                                                                \
+      MODE##_LOAD                                                                                          \
+      _Pragma("unroll") for (int h = 0; h < XW_NH; ++h) {                                                  \
+        const int8 x = xacc[t][h];                                                                         \
+        const int is[8] = {x.s0, x.s1, x.s2, x.s3, x.s4, x.s5, x.s6, x.s7};                                \
+        float v = as * dc[h] * (float)is[r];                                                               \
+        MODE##_OP                                                                                          \
+        ow[h] = as_uint(v);                                                                                \
+      }                                                                                                    \
+      EPI_WR(cp, o);                                                                                       \
+    }                                                                                                      \
+  }
+#define EPI_SWI_LOAD o = EPI_RD(cp);
+#define EPI_SWI_OP                     \
+  {                                    \
+    const float gt = as_float(ow[h]);  \
+    v *= gt / (1.0f + exp(-gt));       \
+  }
+  // (store and add share one loop with the add under its per-value condition, as in the plain epilogue: a loop for
+  //  the add alone let -cl-mad-enable fuse the product into it, and split-K sums differed by an ulp (the 125H's
+  //  xw_peak --emu, 23,285 of 65,536 values; FP_CONTRACT OFF does not stop it). XW_EPI2_FMA: that fused form, to
+  //  compare)
+#define EPI_GEN_LOAD \
+  if (accumulate == 1) o = EPI_RD(cp);
+#ifdef XW_EPI2_FMA
+#define EPI_GEN_OP \
+  if (accumulate == 1) v = fma(as * dc[h], (float)is[r], as_float(ow[h]));
+#else
+#define EPI_GEN_OP \
+  if (accumulate == 1) v += as_float(ow[h]);
+#endif
+  if (accumulate == 2) {  // fused SwiGLU: C holds the gate projection, v the up projection
+    EPI_ROWS(EPI_SWI)
+  } else {
+    EPI_ROWS(EPI_GEN)
+  }
+#else
 #pragma unroll
   for (int h = 0; h < XW_NH; ++h) {
     const int g = g0 + h / 2, hg = h & 1;
@@ -280,4 +588,5 @@ __kernel void gemm_xw8(__global const uint* restrict wq, __global const uint* re
       }
     }
   }
+#endif
 }

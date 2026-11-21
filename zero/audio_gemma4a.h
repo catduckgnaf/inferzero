@@ -399,7 +399,12 @@ class AudioGemma4A : public GemmaAudioEncoder {
   }
 
   cl_kernel kern(const char* name) { return e_.kernel("ops", "-DVIT", name); }
+  bool path_said_ = false;  // (E0: the GEMM path's log line written)
   void gemm(cl_mem A, int lda, const FW& w, cl_mem C, int ldc, int c_off, int M, int n) {
+    if (!path_said_) {  // (E0, 2026-11-21: what this encoder's GEMMs run on, said once)
+      path_said_ = true;
+      zlog::eprintf("inferzero: the audio encoder (Gemma 4): f16 GEMMs (vit_gemm_f16, no XMX)\n");
+    }
     cl_kernel k = e_.kernel("ops", "-DVIT -cl-intel-256-GRF-per-thread", "vit_gemm_f16");
     int ld = lda, K = w.K, lc = ldc, co = c_off, ac = 0, mv = n;
     set_args(k, 0, A, ld, w.w, K, C, lc, co, ac, mv);

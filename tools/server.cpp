@@ -411,6 +411,10 @@ class Server {
       r.set("platform", "linux");  // (bash)
 #endif
       r.set("chunk", eng_.max_chunk);
+      {  // (an Intel graphics driver older than the oldest measured right: the web UI's banner, the launchers' line)
+        const std::string dw = ClRt::driver_warning_text();
+        if (!dw.empty()) r.set("driver_warning", dw);
+      }
       r.set("weights", eng_.w8_resident ? "w8-resident" : "w8-just-in-time");
       r.set("vision", has_vision());
       r.set("ocr", ocr_);  // (OCR mode: the web UI shows its tasks)
@@ -709,10 +713,12 @@ class Server {
   }
   void run_batch(const std::vector<GenStep*>& st) {
     const int V = eng_.hp.n_vocab;
+    // (a slot's tokens before its step's token: copy drafting's context, opt.copy_draft; the bound slot's in cached_)
+    auto hist = [&](int k) { return k == cur_slot_ ? &cached_ : &slots_[k].cached; };
     if (st.size() == 1) {
       GenStep& g = *st[0];
       if (g.max_drafts > 0) {
-        g.drafts = eng_.mtp_draft(g.tok, g.max_drafts);
+        g.drafts = eng_.mtp_draft(g.tok, g.max_drafts, hist(g.slot));
         g.dflash = eng_.last_draft_dflash();
         const auto& lv = eng_.verify(g.tok, g.drafts);
         g.rows.assign(lv.begin(), lv.begin() + (1 + g.drafts.size()) * V);
@@ -728,7 +734,7 @@ class Server {
       std::vector<std::vector<int>> rows;
       for (GenStep* g : st) {
         eng_.bind(g->slot);
-        g->drafts = eng_.mtp_draft(g->tok, std::min(g->max_drafts, nd));
+        g->drafts = eng_.mtp_draft(g->tok, std::min(g->max_drafts, nd), hist(g->slot));
         g->dflash = eng_.last_draft_dflash();
         rows.push_back({g->tok});
         rows.back().insert(rows.back().end(), g->drafts.begin(), g->drafts.end());
@@ -1014,9 +1020,10 @@ int main(int argc, char** argv) {
       {"--mtp", ""}, {"--mtp-model", "an MTP head .gguf"}, {"--dflash", "a DFlash2 drafter folder (with model.safetensors)"}, {"--no-dflash", ""},
       {"--draft", "auto, mtp or dflash"}, {"--mmproj", "an mmproj .gguf file"}, {"--no-mmproj", ""},
       {"--image-min-tokens", "a number of tokens"}, {"--image-max-tokens", "a number of tokens"},
-      {"--mtp-drafts", "a number, e.g. 3"}, {"--think-budget", "a number of tokens"}, {"--preserve-thinking", ""},
+      {"--mtp-drafts", "a number, e.g. 3"}, {"--copy-draft", ""}, {"--think-budget", "a number of tokens"}, {"--preserve-thinking", ""},
       {"--kernels", "a folder"}, {"--session-cache-gb", "GiB, 0 = off"}, {"--session-dir", "a folder"},
-      {"--slots", "1..8"}, {"--gpus", "1..64"}, {"--no-swap", ""}, {"--no-web-tools", ""},
+      {"--slots", "1..8"}, {"--gpus", "1..64"}, {"--split", "tensor or layer"}, {"--tensor-split", "shares a GPU, e.g. 3,1"},
+      {"--no-swap", ""}, {"--no-web-tools", ""},
       {"--whisper", "auto (or on), off, or a faster-whisper folder with model.bin"},
       {"--asr", "auto (or on), off, or a Qwen3-ASR .gguf file"}, {"--asr-slots", "1..4"},
       {"--whisper-device", "gpu or npu"}, {"--whisper-max-minutes", "minutes, 1..600"}, {"--no-terminal", ""},
@@ -1112,6 +1119,7 @@ int main(int argc, char** argv) {
       if (so.eo.npu == -2) throw std::runtime_error("--npu: expected on, off or force (got \"" + v + "\")");
     }
     else if (a == "--mtp") so.eo.mtp = true;
+    else if (a == "--copy-draft") so.eo.copy_draft = true;  // (R1, opt-in)
     // (an MTP head in a file of its own, as runz --mtp-model: Flash Next's from SC117's repository; without it the
     //  server only looks for an mtp-*.gguf in the model's folder. gee456, issue #31, 2026-11-17)
     else if (a == "--mtp-model") { so.eo.mtp_model = next(); so.eo.mtp = true; }
@@ -1136,6 +1144,16 @@ int main(int argc, char** argv) {
     else if (a == "--session-dir") so.sess_dir = next();
     else if (a == "--slots") so.eo.slots = std::clamp(to_int(a, next()), 1, 8);
     else if (a == "--gpus") so.gpus = std::clamp(to_int(a, next()), 1, 64);
+    else if (a == "--split") {  // (zero/mgpu: tensor, each layer's matrices over the GPUs; layer, ranges of layers)
+      const std::string v = next();
+      if (v != "tensor" && v != "layer") throw std::runtime_error(a + ": expected tensor or layer (got " + v + ")");
+      so.split_layer = v == "layer";
+    } else if (a == "--tensor-split") {  // (with --split layer: GPU g's share of the layers)
+      const std::string v = next();
+      so.shares.clear();
+      std::stringstream ss(v);
+      for (std::string t; std::getline(ss, t, ',');) so.shares.push_back(to_double(a, t));
+    }
     else if (a == "--no-swap") swap = false;
     else if (a == "--no-web-tools") web_tools = false;
     else if (a == "--whisper") whisper_opt = next(), whisper_given = true;
@@ -1253,7 +1271,7 @@ int main(int argc, char** argv) {
             "  -c, --ctx N|auto      context in tokens (default 40960; auto: the largest that fits the GPU memory)\n"
             "  --port P              port (default 8090);  --host H  address (default 127.0.0.1; 0.0.0.0: this network)\n"
             "  --mtp                 faster answers with the model's own drafts, the same text\n"
-            "  --gpus N              one model over N GPUs\n"
+            "  --gpus N              one model over N GPUs (--split layer: by layers; docs/multi-gpu.md)\n"
             "  --slots N             N conversations at once (1..8)\n"
             "  --precise             Qwen3.8 Flash Next's most accurate mode (prompts about half as fast)\n"
             "  --think-budget N      at most N reasoning tokens a reply\n"
@@ -1294,17 +1312,25 @@ int main(int argc, char** argv) {
             "                        2048; DeepSeek-V4.1 1024; a dense model that nearly fills the GPU's memory 1024)\n"
             "  --mtp                 speculative decoding with the model's MTP block or Gemma assistant drafter\n"
             "  --mtp-model FILE      an MTP head or drafter in a .gguf of its own (implies --mtp): Flash Next's\n"
-            "                        mtp-Qwen3.8-Flash-Next-Q4_0 / -Q8_0.gguf; without it, an mtp-*.gguf in the\n"
-            "                        model's folder is taken\n"
+            "                        mtp-Qwen3.8-Flash-Next-Q4_0 / -Q8_0.gguf; for a dense Qwen3.5 / 3.8 fine-tune\n"
+            "                        without an MTP block, the base model's .gguf (its block must match the model);\n"
+            "                        without it, an mtp-*.gguf in the model's folder is taken\n"
             "  --mtp-drafts N        drafts per step, Qwen 2..7 (default: 7 for Qwen 27B-class, 3 on B-series cards; 7 with\n"
             "                        DFlash2; 5 for MoE; 3 for 4B and Flash Next; 2 otherwise); Gemma 4's drafter\n"
             "                        always drafts 3\n"
+            "  --copy-draft          with --mtp: where the last tokens appeared earlier in the conversation, draft what\n"
+            "                        followed them there (copy drafting; the same text, verified as any drafts)\n"
             "  --npu on|off|force    the NPU (Intel AI Boost) computes part of each prompt chunk next to the GPU\n"
             "                        (Qwen3.8 27B +15 %%, Gemma 4 12B +10 %%; others off, force: on anyway);\n"
             "                        kept when a request switches models; default off (or ARC_NPU=1)\n"
             "  --gpus N              the model split over N GPUs (default 1; Qwen3.5 / 3.6 / 3.8 dense, the 35B-A3B, Flash\n"
             "                        Next and DeepSeek-V4.1; docs/multi-gpu.md): text chat with --slots and batched\n"
             "                        steps; no MTP / DFlash2, images, saved prompts or sessions yet\n"
+            "  --split tensor|layer  with --gpus: tensor (the default) splits each layer's matrices over the GPUs (fast on\n"
+            "                        matching, well-linked cards); layer gives each GPU a range of the layers (the last\n"
+            "                        ones on GPU 0), for a model one card cannot hold, at about one card's speed (Qwen\n"
+            "                        dense; text chat with --slots, as the tensor split)\n"
+            "  --tensor-split a,b,.. with --split layer: each GPU's share of the layers (GPU 0's first; default equal)\n"
             "  --slots N             hold N conversations at once (1..8, default 1), each with its own KV cache and states\n"
             "                        of --ctx tokens (auto: the context that fits N of them; MoE with experts on the\n"
             "                        SSD: 128K in all, at least 32K each); requests in different slots take turns step\n"
@@ -1354,16 +1380,20 @@ int main(int argc, char** argv) {
             "                        GPUs perhaps, less accurate: check the KL first)\n"
             "  --precise             Qwen3.8 Flash Next's precise mode (as ARC_FN_PRECISE=1): BF16 hyper-connection rows and\n"
             "                        router, two int8 passes everywhere: KL 0.0105 -> 0.0060 at 3.5K tokens, prompts about\n"
-            "                        half as fast; other models are unchanged\n"
+            "                        half as fast; other models are unchanged. With ARC_XCPU (the CPU computing missed\n"
+            "                        experts: the default on discrete 16-lane cards) the CPU's experts run one pass by default;\n"
+            "                        ARC_XCPU_Q2=1: both (exact)\n"
             "  GPU: picked at start: Xe2 / Xe3 GPUs (no 8-lane sub-groups) get 16-lane kernels, and XMX for the prompt\n"
             "  GEMMs when their results match the DP4a kernels' on a test (ARC_NO_XMX=1: DP4a; ARC_NO_SG8=1: 16 lanes).\n"
             "  Discrete cards also: prompt attention as flash attention on XMX (ARC_ATTN_FX=0: off; iGPUs with 16-lane\n"
-            "  XMX too), the H8 GEMM in work-groups of 4 (ARC_GEMM_XW_WGX=1: of 1) with 2D block loads\n"
+            "  XMX too; the A770 / A750 and the Arc 140T opt-in: ARC_ATTN_X8=1), the H8 GEMM in work-groups of 4 (ARC_GEMM_XW_WGX=1: of 1) with 2D block loads\n"
             "  (ARC_GEMM_XW_2D=0: off), dense models' GEMV reading one window ahead (ARC_GEMV_DB=0: off), GEMV rows\n"
             "  from the GPU's thread count (ARC_GEMV_WAVE=0: off), resident decoded weights in the room the context\n"
             "  leaves (ARC_W8_PARTIAL_GB=0: off, N: N GB; an iGPU: only N, or up to 16 GB with 16-lane XMX and a GPU\n"
-            "  share of 64 GiB or more). Alchemist cards (A770, A750, A580) take the Arc 140T preset: XMX and H8 on\n"
-            "  weights decoded just in time (ARC_140T=0: off)\n"
+            "  share of 64 GiB or more), the FFN's gate and up GEMMs in one launch on 16-lane XMX (ARC_GEMM_XW_GU=0: off).\n"
+            "  Alchemist cards (A770, A750, A580) take the Arc 140T preset: XMX and H8 on weights decoded just in time\n"
+            "  (ARC_140T=0: off), a tile per prompt GEMM shape on one GPU (ARC_GEMM_XW_SHAPE=0: one tile) and the\n"
+            "  32-token tiles' reads one step ahead (ARC_GEMM_XW_DB=0: off)\n"
             "  --kernels DIR         kernel folder (default zero/kernels, looked for in the current folder, next to the\n"
             "                        program and in its parent folder);  --webui DIR  web UI folder (default webui, the same)\n"
             "  --log-verbosity N, -lv N  the log: 0 errors, 1 + warnings, 2 + info (default), 3 + debug (every\n"
@@ -1419,6 +1449,7 @@ int main(int argc, char** argv) {
   if (so.eo.kernel_dir == "kernels" || so.eo.kernel_dir == "zero/kernels") so.eo.kernel_dir = find_dir(so.eo.kernel_dir);
   if (so.webui.empty()) so.webui = find_dir("webui");
   srvstart::print(exe_dir, false);  // (the log's first lines: build, system, switches; tools/server_startup.h)
+  srvstart::print_options(exe_dir, std::vector<std::string>(argv + 1, argv + argc));  // (the catalog's options, in words)
   if (alias.empty()) alias = std::filesystem::path(model).stem().string();
   // -m none: speech to text only (transcripts), a chat model loaded later by the first request naming one; with no
   // speech option given, Qwen3-ASR alone (the default transcript model, ~3.7 GB of GPU memory)
@@ -2415,6 +2446,7 @@ int main(int argc, char** argv) {
         r.set("modalities", mod);
         r.set("audio", false);
         if (!so.whisper_props.is_null()) r.set("whisper", so.whisper_props);
+        if (const std::string dw = ClRt::driver_warning_text(); !dw.empty()) r.set("driver_warning", dw);
         return rs.send(200, "application/json", r.dump());
       }
     }
@@ -2559,7 +2591,7 @@ int main(int argc, char** argv) {
     //  the error. Not loaded again here: a GPU that hung keeps its memory and usually its fault until the driver
     //  resets it, so the way back is a restart of the server)
     std::shared_lock<std::shared_mutex> lk(swap_mu);
-    if (cur && cur->tp && cur->tp->broken() && rq.path == "/health")
+    if (cur && ((cur->tp && cur->tp->broken()) || (cur->pp && cur->pp->broken())) && rq.path == "/health")
       return rs.send(503, "application/json",
                      "{\"status\":\"error\",\"message\":\"a GPU failed or hangs: restart the server (zero-server restart)\"}");
     if (!cur) {  // (a chat request naming no model, or an unknown one, while none is loaded)

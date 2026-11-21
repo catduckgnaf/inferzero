@@ -243,9 +243,11 @@
       auto q8 = q4 ? quantize_rows_q4_0(v.data(), lm_head_.N, lm_head_.K) : quantize_rows_q8_0(v.data(), lm_head_.N, lm_head_.K);
       lm_head_.type = q4 ? GGML_Q4_0 : GGML_Q8_0;
       lm_head_.raw = upload_padded(lm_head_.type, q8.data(), q8.size());
+      load_draft_head(lm_head_.type, q8.data(), q8.size());  // (ARC_MTP_VOCAB: engine_drafters.h)
     } else {
       lm_head_.type = lt.type;
       lm_head_.raw = upload_padded(lt.type, lt.data, lt.nbytes);
+      load_draft_head(lt.type, lt.data, lt.nbytes);
     }
   }
 

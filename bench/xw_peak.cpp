@@ -145,14 +145,18 @@ __kernel void ldprobe(__global const uint* ap, __global const uint* wp, int nch,
 using clk = std::chrono::steady_clock;
 
 struct Shape { int N, K, a; const char* name; };
-struct Variant { std::string name; const char* defs; int tm, nc; bool pa, pw; int wgx = 1; bool lock = false; };
+// (wgy: token sub-groups a work-group, fixed; 0 = the engine's choice. The XW_SLM variants need it fixed: -DXW_WGY)
+struct Variant { std::string name; const char* defs; int tm, nc; bool pa, pw; int wgx = 1; bool lock = false; int wgy = 0; };
 
 static uint32_t g_seed = 12345;
 static uint32_t rnd() { g_seed = g_seed * 1664525u + 1013904223u; return g_seed; }
+#include "xw_all.h"  // (--all: every packed form, staged; 2026-11-21)
 
 int main(int argc, char** argv) {
-  int M = 4096, iters = 10, wgx = 1;
-  bool force_emu = false, probe = false, lock = false;
+  int M = 4096, iters = 10, wgx = 1, lanes = 0;
+  bool force_emu = false, probe = false, lock = false, all_mode = false;
+  AllSel sel;
+  std::vector<int> Ms;
   std::string only, kdir = "zero/kernels";
   std::vector<Shape> shapes;
   for (int i = 1; i < argc; ++i) {
@@ -187,9 +191,41 @@ int main(int argc, char** argv) {
              "  --emu           DPAS emulated on any GPU (correctness only, the times mean nothing)\n"
              "  --probe         the packed loop on data in the first-level cache: loads and DPAS, loads only,\n"
              "                  DPAS only (is the GEMM short of load bandwidth or of something else)\n"
-             "  --kernels DIR   the kernel sources (default zero/kernels)\n");
+             "  --kernels DIR   the kernel sources (default zero/kernels)\n"
+             "  --all           every gemm_xw8 form with both operands packed (~600: plain TM 16 / 32 / 64 x NC 1 / 2 / 4 x\n"
+             "                  WGX 1 / 2 / 4 x DB 0 / 1 / 2 x EPI2 0 / 1; local memory TM x NC x X,Y 2 / 4 / 8 x CPS 1 / 2 / 4\n"
+             "                  where it fits in 64 KB, x EPI2), in stages: 0 build and drop spills, 1 every survivor\n"
+             "                  quickly, 2 the --top again and bit for bit, 3 the best 3 with ARC_GEMM_RG and the prefetch.\n"
+             "                  An untimed launch before every timing, a progress bar with the time left. Default shapes:\n"
+             "                  the 27B's gate, up+SwiGLU, down, qkv, z, ssm_out. Within 1 %% the smaller binary ranks first\n"
+             "  --ms 128,512,4096   the token counts for --all (default 128,512,4096)\n"
+             "  --stages 0123   which stages (0 and 1 always run before 2 and 3)\n"
+             "  --family plain,slm  --tm 16,32,64  --nc 1,2,4  --wg 4x4,8x4  --cps 1,2,4  --db 0,1,2  --epi2 0,1\n"
+             "                  only those forms;  --limit N  the first N (a quick test);  --top N  stage 2's (10)\n"
+             "  --env-out FILE  each winner as the engine's switches, a line per token count and place\n"
+             "  --lanes 16      --all for the 16-lane XMX GEMM (gemm_xw.cl: B-series, Lunar Lake / Panther Lake, a Max):\n"
+             "                  TM 16 / 32 / 64 x NC 1 / 2 / 4 / 6 / 8 x WGX 1 / 2 / 4 / 8 x the lock, and with 2D block\n"
+             "                  loads each 2D form (--family plain,2d); the default where the GPU has no 8-lane\n"
+             "                  sub-groups. Elsewhere the DPAS is emulated (correctness only). The peak: bin/gpu_bench\n");
       return 0;
     } else if (a == "--probe") probe = true;
+    else if (a == "--all") all_mode = true;
+    else if (a == "--lanes" && i + 1 < argc) {
+      lanes = atoi(argv[++i]);
+      if (lanes != 8 && lanes != 16) { fprintf(stderr, "--lanes must be 8 or 16\n"); return 2; }
+    }
+    else if (a == "--ms" && i + 1 < argc) { for (int v : AllSel::ints(argv[++i])) Ms.push_back(v); }
+    else if (a == "--stages" && i + 1 < argc) sel.stages = argv[++i];
+    else if (a == "--family" && i + 1 < argc) sel.family = AllSel::strs(argv[++i]);
+    else if (a == "--tm" && i + 1 < argc) sel.tm = AllSel::ints(argv[++i]);
+    else if (a == "--nc" && i + 1 < argc) sel.nc = AllSel::ints(argv[++i]);
+    else if (a == "--cps" && i + 1 < argc) sel.cps = AllSel::ints(argv[++i]);
+    else if (a == "--epi2" && i + 1 < argc) sel.epi2 = AllSel::ints(argv[++i]);
+    else if (a == "--db" && i + 1 < argc) sel.db = AllSel::ints(argv[++i]);
+    else if (a == "--wg" && i + 1 < argc) sel.wg = AllSel::strs(argv[++i]);
+    else if (a == "--limit" && i + 1 < argc) sel.limit = atoi(argv[++i]);
+    else if (a == "--top" && i + 1 < argc) sel.top = std::max(1, atoi(argv[++i]));
+    else if (a == "--env-out" && i + 1 < argc) sel.env_out = argv[++i];
     else if (a == "--shape" && i + 1 < argc) {
       int n = 0, k = 0, ac = 0;
       const std::string s = argv[++i];
@@ -201,7 +237,13 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
+  if (shapes.empty() && all_mode)  // (--all: the 27B's FFN and its attention / DeltaNet projections)
+    shapes = {{17408, 5120, 0, "gate"}, {17408, 5120, 2, "up+SwiGLU"}, {5120, 17408, 0, "down"},
+              {10240, 5120, 0, "qkv"},  {6144, 5120, 0, "z"},           {5120, 6144, 0, "ssm_out"}};
   if (shapes.empty()) shapes = {{17408, 5120, 0, "gate"}, {17408, 5120, 2, "up+SwiGLU"}, {5120, 17408, 0, "down"}};
+  if (Ms.empty()) Ms = {128, 512, 4096};
+  for (int v : Ms)
+    if (v <= 0 || v % 32) { fprintf(stderr, "--ms: each a positive multiple of 32\n"); return 2; }
   if (M <= 0 || M % 32) { fprintf(stderr, "--m must be a positive multiple of 32\n"); return 2; }
   for (const Shape& s : shapes)
     if (s.N % 32 || s.K % 256 || s.N <= 0 || s.K <= 0 || (s.a != 0 && s.a != 2)) {
@@ -218,11 +260,18 @@ int main(int argc, char** argv) {
   zrt::rcl::getDeviceInfo(zrt::rcl::device, 0x1002, sizeof(eus), &eus, nullptr);
   zrt::rcl::getDeviceInfo(zrt::rcl::device, 0x100C, sizeof(mhz), &mhz, nullptr);
   printf("xw_peak: %s, %u EUs, %u MHz, driver %s\n", name, eus, mhz, drv);
-  if (!cl.sg8) {
-    printf("This GPU has no 8-lane sub-groups: gemm_xw8 is the 8-lane kernel (Arc 140T, Xe-LPG); nothing to measure.\n");
+  if (!lanes) lanes = cl.sg8 ? 8 : 16;  // (16 lanes where there are no 8-lane sub-groups: B-series, Xe2 / Xe3 iGPUs)
+  if (lanes == 8 && !cl.sg8) {
+    printf("This GPU has no 8-lane sub-groups: gemm_xw8 is the 8-lane kernel (Arc 140T, Xe-LPG); --all --lanes 16 sweeps "
+           "this GPU's gemm_xw.\n");
     return 0;
   }
-  const bool emu = force_emu || !cl.xmx;
+  if (lanes == 16 && !all_mode) {
+    printf("--lanes 16 is for --all (the 16-lane GEMM's forms); the default and --probe are the 8-lane kernel's\n");
+    return 2;
+  }
+  // (16 lanes: emulated where the GPU has no 16-lane XMX, as the engine's xw_emu_: no XMX, or 8-lane DPAS only)
+  const bool emu = force_emu || !cl.xmx || (lanes == 16 && cl.sg8);
   cl.soft_fail = true;
   std::vector<int> host(256);
   for (int i = 0; i < 256; ++i) host[i] = (int)((0x01020304u * (uint32_t)(i + 1)) ^ 0x5a5a5a5au) & 0x3f3f3f3f;
@@ -230,7 +279,8 @@ int main(int argc, char** argv) {
 
   // ---- the peak: int8 DPAS chains (gpu_bench's probe), best of ~1 s
   double peak = 0;
-  if (!emu) {
+  if (lanes == 16 && !emu) printf("16 lanes: the share of the peak is not shown here (bin/gpu_bench measures the peak)\n");
+  if (!emu && lanes == 8) {
     try {
       const int groups = std::max(256u, eus * 16), piters = 2048;
       cl_mem bo = cl.buffer(CL_MEM_READ_WRITE, (size_t)groups * 64 * 4);
@@ -272,11 +322,13 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
       printf("f16 DPAS precision: not measured (%s)\n", e.what());
     }
-  } else {
-    printf("DPAS emulated (%s): the results are checked, the times mean nothing\n", cl.xmx ? "--emu" : "no XMX here");
+  } else if (emu) {
+    printf("DPAS emulated (%s): the results are checked, the times mean nothing\n",
+           cl.xmx ? (lanes == 16 && cl.sg8 ? "8-lane DPAS only here" : "--emu") : "no XMX here");
   }
 
-  const std::string src = read_file(kdir + "/gemm_xw8.cl");
+  const std::string src = read_file(kdir + (lanes == 16 ? "/gemm_xw.cl" : "/gemm_xw8.cl"));
+  if (all_mode) return run_all(cl, src, emu, peak, shapes, Ms, iters, sel, lanes);
   if (probe) {
     // ---- where the loop's time goes: loads against DPAS, on cache-resident data (see kLdProbe)
     const int groups = (int)(eus * 16), nch = 64;
@@ -329,10 +381,37 @@ int main(int argc, char** argv) {
       {"plain 16x64", "", 16, 4, false, false},  {"packAW 16x64", "-DXW_PACKA -DXW_PACKW", 16, 4, true, true},
       {"plain 64x16", "", 64, 1, false, false},  {"packAW 64x16", "-DXW_PACKA -DXW_PACKW", 64, 1, true, true},
       {"plain 32x64", "", 32, 4, false, false},  {"packAW 64x32", "-DXW_PACKA -DXW_PACKW", 64, 2, true, true},
+      // (2026-11-21, the A770 plan) the engine's Alchemist default for the big GEMMs (32 x 16, 4 column sub-groups,
+      //  the read-ahead loop), then -DXW_SLM: the work-group's chunk copied to local memory, double-buffered (" 4x4":
+      //  4 column x 4 token sub-groups a work-group). ocloc dg2-g10, 256 registers: no spill for these four
+      {"A770 32x16 w4 DB", "-DXW_PACKA -DXW_PACKW -DXW_DB", 32, 1, true, true, 4},
+      {"slm 32x16 4x4", "-DXW_PACKA -DXW_PACKW -DXW_SLM", 32, 1, true, true, 4, false, 4},
+      {"slm 32x32 4x4", "-DXW_PACKA -DXW_PACKW -DXW_SLM", 32, 2, true, true, 4, false, 4},
+      // (2026-11-21) -DXW_EPI2 (" e2"): the epilogue a row at a time, one block message of the row's columns, the
+      //  accumulate mode decided once. ocloc dg2-g10: 32 x 32 525 -> 301 messages, with SLM 457 -> 233; no spill
+      {"A770 32x16 w4 DB e2", "-DXW_PACKA -DXW_PACKW -DXW_DB -DXW_EPI2", 32, 1, true, true, 4},
+      {"packAW 32x32 w2", "-DXW_PACKA -DXW_PACKW", 32, 2, true, true, 2},
+      {"packAW 32x32 w2 e2", "-DXW_PACKA -DXW_PACKW -DXW_EPI2", 32, 2, true, true, 2},
+      {"slm 32x32 4x4 e2", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2", 32, 2, true, true, 4, false, 4},
+// (2026-11-21, the sweep of bigger work-groups: the engine's ARC_GEMM_XW_SLM_TILE / _WG / _CPS. Only those ocloc
+//  dg2-g10 builds without a spill at 256 registers: CPS 2 spills at 32 x 32 and at 64 x 16 8 x 2)
+{"slm 32x32 4x8 e2", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2", 32, 2, true, true, 4, false, 8},
+{"slm 32x32 8x4 e2", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2", 32, 2, true, true, 8, false, 4},
+{"slm 64x16 4x4 e2", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2", 64, 1, true, true, 4, false, 4},
+{"slm 64x16 8x4 e2", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2", 64, 1, true, true, 8, false, 4},
+{"slm 64x16 8x2 e2", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2", 64, 1, true, true, 8, false, 2},
+{"slm 32x16 8x4 e2", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2", 32, 1, true, true, 8, false, 4},
+{"slm 32x16 8x4 c2 e2", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2 -DXS_CPS=2", 32, 1, true, true, 8, false, 4},
+      // (2026-11-21) -DXW_PTR (" p"): the local-memory copy's addresses set once before the loop (ocloc dg2-g10, the
+      // big tile's loop: 410 -> 184 instructions for 33 DPAS); the same results bit for bit
+      {"slm 32x32 4x4 e2 p", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2 -DXW_PTR", 32, 2, true, true, 4, false, 4},
+      {"slm 32x16 4x4 e2 p", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2 -DXW_PTR", 32, 1, true, true, 4, false, 4},
+      {"slm 32x32 4x4 c2 e2 p", "-DXW_PACKA -DXW_PACKW -DXW_SLM -DXW_EPI2 -DXS_CPS=2 -DXW_PTR", 32, 2, true, true, 4, false, 4},
   };
   std::vector<Variant> cand = all;
   if (wgx > 1 || lock)  // (each variant again with the column sub-groups and / or the lock: " w2", " w4L", " L")
     for (Variant v : all) {
+      if (v.wgy || v.wgx > 1) continue;  // (the fixed work-groups above keep theirs)
       v.wgx = wgx, v.lock = lock;
       v.name += std::string(" ") + (wgx > 1 ? "w" + std::to_string(wgx) : std::string()) + (lock ? "L" : "");
       cand.push_back(v);
@@ -348,7 +427,8 @@ int main(int argc, char** argv) {
     const std::string opts = std::string("-cl-std=CL3.0 -cl-mad-enable -cl-intel-256-GRF-per-thread -DXW_TM=") +
                              std::to_string(vs[v].tm) + " -DXW_NC=" + std::to_string(vs[v].nc) + " " + vs[v].defs +
                              (vs[v].wgx > 1 ? " -DXW_WGX=" + std::to_string(vs[v].wgx) : std::string()) +
-                             (vs[v].lock ? " -DXW_LOCK" : "") + (emu ? " -DXW_EMU" : "");
+                             (vs[v].lock ? " -DXW_LOCK" : "") + (vs[v].wgy ? " -DXW_WGY=" + std::to_string(vs[v].wgy) : std::string()) +
+                             (emu ? " -DXW_EMU" : "");
     try {
       ks[v] = cl.kernel(cl.build(src, opts), "gemm_xw8");
       ze_kernel_properties_t kp{};
@@ -403,6 +483,10 @@ int main(int argc, char** argv) {
       int wgy = 1;
       while (wgy < 8 && (M / tm) % (wgy * 2) == 0) wgy *= 2;
       while (va.wgx * wgy > 32 && wgy > 1) wgy /= 2;
+      if (va.wgy) {
+        if ((M / tm) % va.wgy) continue;  // (the fixed work-group does not divide these tokens)
+        wgy = va.wgy;
+      }
       size_t gws[2] = {(size_t)8 * nb * (M / tm / wgy), (size_t)wgy}, lws[2] = {(size_t)8 * va.wgx, (size_t)wgy};
       cl_kernel k = ks[v];
       auto launch = [&] {

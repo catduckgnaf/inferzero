@@ -15,9 +15,20 @@
   // DP4a default (256 registers: DP4a spills with 128). The start-time check runs its kernels too. ARC_140T=0: off;
   // ARC_140T=1 with ARC_XMX_TRY=2: on the 125H with DP4a standing in for DPAS (tests)
   bool p140_ = false;
-  static constexpr int kP140Min = 512;
+  // (p140_res_: the weights resident in W8 for the chunks below kP140Min, and those of kP140Min+ still decoded just in
+  //  time from the raw rows into the staging (an A770's 4B: 128 tokens 1,197 just in time against 2,381 resident, 4K
+  //  5,028 against 3,325). ARC_140T_RES=1, engine_setup.h plan_weights)
+  bool p140_res_ = false;
+  // (from kP140Min tokens XMX takes a chunk; with p140_res_ from kP140MinRes, where the resident DP4a GEMM stops being
+  //  faster: an A770, 3 runs each, XMX against resident DP4a, 4B 640 tokens 3,101 / 3,208, 768 3,395 / 3,282; 9B 640
+  //  1,757 / 1,847, 768 2,035 / 1,872. ARC_140T_MIN=n: from n)
+  static constexpr int kP140Min = 512, kP140MinRes = 768;
+  static int p140_min(bool res) {
+    static const int e = getenv("ARC_140T_MIN") ? atoi(getenv("ARC_140T_MIN")) : 0;
+    return e > 0 ? e : res ? kP140MinRes : kP140Min;
+  }
   bool p140_take(const GpuWeight& w, int Mp) const {
-    return p140_ && !w.wq && w.gemm_qtype >= 100 && w.gemm_qtype <= 103 && Mp >= kP140Min && Mp % 32 == 0 && w.N % 32 == 0;
+    return p140_ && (!w.wq || p140_res_) && w.gemm_qtype >= 100 && w.gemm_qtype <= 103 && Mp >= p140_min(p140_res_) && Mp % 32 == 0 && w.N % 32 == 0;
   }
   // ---- H8 + 4 column groups by default on discrete cards with 16-lane XMX, for the Qwen dense models (issue #4,
   // 2026-11-08, a Pro B60, 27B, package d980970: 512 tokens 615 -> 677 tok/s, 4K 766 -> 1,024, 16K 706 -> 937; KL
@@ -51,17 +62,20 @@
     //  The start-time checks still turn it off if its kernels differ or do not build)
     // (the models it was measured on: Qwen dense, as h8_auto_; not MoE, Gemma, Flash Next or Qwen3 dense, and not with
     //  ARC_H8_SB=1, whose staged form it does not track. Self audit 2026-11-08)
-    return (cl_.xmx || test) && cl_.sg8 && !w8_resident && !hp.moe && !hp.gemma && !hp.hc && !hp.qwen3 && h8_row();
+    return (cl_.xmx || test) && cl_.sg8 && (!w8_resident || p140_res_) && !hp.moe && !hp.gemma && !hp.hc && !hp.qwen3 && h8_row();
   }
   // (the preset would apply but for the resident weights: the reason the log gives, hansong80's A770, issue #35)
   bool p140_off_resident() const {
     const char* e = getenv("ARC_140T");
-    return !(e && atoi(e) == 0) && cl_.xmx && cl_.sg8 && w8_resident && !hp.moe && !hp.gemma && !hp.hc && !hp.qwen3 &&
+    return !(e && atoi(e) == 0) && cl_.xmx && cl_.sg8 && w8_resident && !p140_res_ && !hp.moe && !hp.gemma && !hp.hc && !hp.qwen3 &&
            h8_row();
   }
   // (128 registers only where a register is 64 bytes: on a GPU with 8-lane sub-groups, 32-byte registers, ocloc shows
   //  the XMX GEMM spilling with 128)
-  bool xe2_grf128() const { return xe2_ && (!cl_.sg8 || getenv("ARC_XMX_TRY")); }
+  bool xe2_grf128() const {
+    static const bool xmx_try = getenv("ARC_XMX_TRY") != nullptr;  // (read once: on the verification GEMVs' path)
+    return xe2_ && (!cl_.sg8 || xmx_try);
+  }
 
   // the dense prompt GEMM with the default register file (128) instead of 256 registers per thread: more threads per
   // core; on a Pro B60 the 27B's prompt went 450 -> 617 tok/s (issue #4, 2026-11-02). ARC_GEMM_GRF=256 as before.
@@ -84,9 +98,46 @@
   // (128 by default on discrete cards with 16-lane XMX since 2026-11-16: a Pro B70's 35B 8K prompt 5,377 / 5,338 ->
   //  5,612 tok/s, +4.4-5.1 % (joshdev-de, issue #27, release 2026.11.16.12); the same source, another register file.
   //  iGPUs keep 256 (the 128 build spilled there). ARC_MOE_GRF=256: as before)
+  // A Data Center GPU Max (Xe-HPC) takes its own defaults where hibagus's one-stack Max 1550 sweeps measured a gain
+  // (issue #48, 2026-11-20, main 03c310a; every winner's logits the same as the defaults'): 27B generation
+  // ARC_GVROWS=1 (27.77 -> 29.70 tok/s); 27B prompt ARC_H8_NORM=0, ARC_H8_REUSE=0, ARC_GEMM_XW_PF=2, ARC_GEMM_XW_WGX=8
+  // (together 4K 2,645 -> 2,910, +10.0 %); 35B-A3B generation ARC_MOE_GR_GU=4 + ARC_MOE_GR_DN=8 (81.6 -> 88.0);
+  // 35B-A3B prompt ARC_MOE_GRF=256 + ARC_MOE_CG=4 (4K 4,665 -> 5,138). Each switch set by hand decides as before;
+  // other GPUs unchanged. (Kept once per engine: each GPU of a split decides for its own)
+  mutable int xehpc_ = -1;
+  bool xehpc_on() const {
+    if (xehpc_ < 0) xehpc_ = !zrt::integrated() && !cl_.sg8 && zrt::xehpc() ? 1 : 0;
+    return xehpc_ == 1;
+  }
+  // A discrete Battlemage card of the B60's die (BMG-G21: the Pro B60, the B580, the B50), by its PCI device ID
+  // (zrt::bmg_g21), not its core count: a Pro B65 is the B70's die (BMG-G31, 0xE222) with the B60's 160 EUs, and keeps
+  // the B70's defaults until it is measured. 2026-11-21: its own defaults where two B60s measured them, each
+  // bit-identical:
+  //  - the prompt GEMM's tile 64 x 32 with 8 column sub-groups a work-group, the 2D form's prefetch 1 chunk ahead
+  //    (engine_xw.h xw_tm / xw_nc / xw_wgx / xw_pfd_v): skipzx-lab's phase X (issue #57, Linux, ec99a4a), the 27B
+  //    512 / 4K / 32K prompt 1,109.9 / 1,872.5 / 1,619.3 -> 1,171.8 / 1,954.2 / 1,680.0 tok/s (+5.6 / +4.4 / +3.7 %),
+  //    logits the same at each, 0.0 % drift; the start check proves the form bit for bit as any other;
+  //  - the one-token GEMVs' rows by type, not by the thread count (ARC_GEMV_WAVE's single-token part, xe2_gemv_rows):
+  //    the 27B's generation +3.5 % (skipzx-lab, Linux, 23.29 -> 24.10 tok/s) and +2.4 % (MaineTim, issue #19,
+  //    23.36 -> 23.91), logits the same. Its 2-8-token part (MTP verification) stays, not measured apart.
+  // Each switch set by hand still wins.
+  mutable int g21_ = -1;
+  bool xe2_g21() const {
+    if (g21_ < 0) {
+      g21_ = !zrt::integrated() && cl_.xmx && !cl_.sg8 && !xehpc_on() && zrt::bmg_g21() ? 1 : 0;
+      if (g21_) {
+        static std::once_flag said;
+        std::call_once(said, [] {
+          zlog::eprintf("inferzero: the B60's die (BMG-G21, device 0x%04X): its own prompt tile and GEMV rows\n",
+                        zrt::pci_device_id());
+        });
+      }
+    }
+    return g21_ == 1;
+  }
   std::string xe2_moe_grf() const {
-    const char* e = getenv("ARC_MOE_GRF");
-    const bool grf128 = e ? std::string(e) == "128" : (!zrt::integrated() && cl_.xmx && !cl_.sg8);
+    static const char* e = getenv("ARC_MOE_GRF");  // (read once)
+    const bool grf128 = e ? std::string(e) == "128" : (!zrt::integrated() && cl_.xmx && !cl_.sg8 && !xehpc_on());
     return xe2_ && grf128 ? std::string() : std::string("-cl-intel-256-GRF-per-thread ");
   }
   // ARC_GEMM_CG=2 / 4: 16-column groups per work-group of the prompt GEMM (a matrix whose column groups it does not
@@ -122,13 +173,20 @@
   // prefetch; bit-identical. Not with ARC_GV_PROBE. On by default where the prefetch was (discrete cards) since
   // 2026-11-15: a Pro B70's 27B 31.88 / 31.90 / 31.84 -> 32.25 / 32.32 / 32.32 tok/s in three alternated rounds (+1.4 %;
   // median step 31.2 -> 30.8 ms), logits identical (joshdev-de, issue #27, 6466672). Dense models only: the MoE models' gains of the prefetch (the 35B +11 % on a B60) are not measured with it. ARC_GEMV_DB=0: the prefetch
-  std::string xe2_gemv_pf() const {
-    static const int dbe = getenv("ARC_GEMV_DB") ? (atoi(getenv("ARC_GEMV_DB")) != 0 ? 1 : 0) : -1;
-    const bool db = !getenv("ARC_GV_PROBE") && (dbe < 0 ? (cl_.xmx && !cl_.sg8 && !zrt::integrated() && hp.n_expert == 0 && !getenv("ARC_GEMV_PF")) : dbe == 1);
-    if (db) return std::string(" -DGEMV_DB");
-    static const int pf = getenv("ARC_GEMV_PF") ? (atoi(getenv("ARC_GEMV_PF")) != 0 ? 1 : 0) : -1;
-    const bool on = pf < 0 ? (cl_.xmx && !cl_.sg8 && !zrt::integrated()) : pf == 1;
-    return on ? std::string(" -DGEMV_PF") : std::string();
+  // (decided once per engine: it is on every GEMV's path, and its getenv calls take the C runtime's lock, which a
+  //  split model's shard threads share; issue #4, 2026-11-21)
+  mutable int gemv_pf_kind_ = -1;  // 0 none, 1 -DGEMV_DB, 2 -DGEMV_PF
+  const std::string& xe2_gemv_pf() const {
+    static const std::string defs[3] = {std::string(), std::string(" -DGEMV_DB"), std::string(" -DGEMV_PF")};
+    if (gemv_pf_kind_ < 0) {
+      static const int dbe = getenv("ARC_GEMV_DB") ? (atoi(getenv("ARC_GEMV_DB")) != 0 ? 1 : 0) : -1;
+      static const bool probe = getenv("ARC_GV_PROBE") != nullptr, pf_set = getenv("ARC_GEMV_PF") != nullptr;
+      const bool db = !probe && (dbe < 0 ? (cl_.xmx && !cl_.sg8 && !zrt::integrated() && hp.n_expert == 0 && !pf_set) : dbe == 1);
+      static const int pf = getenv("ARC_GEMV_PF") ? (atoi(getenv("ARC_GEMV_PF")) != 0 ? 1 : 0) : -1;
+      const bool on = pf < 0 ? (cl_.xmx && !cl_.sg8 && !zrt::integrated()) : pf == 1;
+      gemv_pf_kind_ = db ? 1 : on ? 2 : 0;
+    }
+    return defs[gemv_pf_kind_];
   }
   // ARC_GEMV_WAVE (2026-11-15): the single-token GEMV's rows per sub-group (gemv and gemv_v) by the GPU's thread
   // count T (EUs x threads per EU: a Pro B70 2,048, a B60 1,280) instead of by type: a matrix of T < N <= 4T rows takes
@@ -151,7 +209,9 @@
   }
   int xe2_gemv_rows(const GpuWeight& w, int rows) const {
     static const bool fixed = getenv("ARC_GVROWS") != nullptr;
-    const int t = fixed ? 0 : xe2_gemv_threads();
+    static const bool wave_set = getenv("ARC_GEMV_WAVE") != nullptr;
+    // (a Max: one row, as ARC_GVROWS=1, see xehpc_on; the B60's die: by type, see xe2_g21)
+    const int t = fixed || xehpc_on() || (!wave_set && xe2_g21()) ? 0 : xe2_gemv_threads();
     if (t <= 0 || w.N <= t || w.N > 65536) return rows;
     return w.N <= 4 * t ? 4 : 1;
   }
@@ -210,7 +270,14 @@
   // 3 since 2026-11-18: the same B70, runz --mtp, a code prompt, 256 asked: drafts 2 / 3 / 4 58.2 / 59.8 / 57.5 tok/s,
   // accepted 75.0 / 70.6 / 60.4 %, 2.38 / 2.79 / 2.88 tokens a pass (joshdev-de, issue #27, 7368768): the 4th draft is
   // accepted too seldom to pay its verification
-  int xe2_mtp_drafts(int d) const { return d == 7 && !zrt::integrated() && cl_.xmx && !cl_.sg8 ? 3 : d; }
+  // Alchemist (discrete, 8-lane XMX) 4 since 2026-11-21: an A770 (xe, 150 W), the 27B on a coding question, 256 tokens,
+  // the full sweep's D phase: plain 22.02 tok/s; drafts 2 / 3 / 4 / 5 / 6 / 7 42.06 / 45.56 / 46.08 / 45.11 / 43.74 /
+  // 40.75 (7 accepted 60.4 %, 4 76.8 %), every text the plain one's (skipzx-lab, issue #45). Its verify pass costs more
+  // than a B-series card's (83.7 ms against a B60's 53.6), so its best count sits between theirs and the laptop's
+  int xe2_mtp_drafts(int d) const {
+    if (d != 7 || zrt::integrated() || !cl_.xmx) return d;
+    return cl_.sg8 ? 4 : 3;
+  }
   int xe2_gdn_l1pf() const {
     static const int e = getenv("ARC_GDN_L1PF") ? std::clamp(atoi(getenv("ARC_GDN_L1PF")), 0, 64) : -1;
     return e >= 0 ? e : (zrt::integrated() ? 0 : 2);
@@ -352,41 +419,70 @@
   // spans and the sparse masks stay on attn_q8. On by default on discrete cards (16-lane XMX); ARC_ATTN_FX=0: attn_q8,
   // =1 forces it, =2 without the check (the kernel's timing ablations); ARC_ATTN_FX_WG="NT,NH": token groups of 8 x q
   // heads per work-group; ARC_ATTN_FX_PF=0: no L1 prefetch; ARC_ATTN_FX_DEFS: further -D options (tests)
-  std::string attnfx_src_;
+  //
+  // attn_x8 (QUEUE A6 / T4, 2026-11-20; zero/kernels/attn_x8.cl): the same flash attention for GPUs whose DPAS takes
+  // 8-lane sub-groups (Alchemist A770 / A750, the Arc 140T), whose prompts ran attn_q8 on DP4a. Opt-in until owners
+  // measure it: ARC_ATTN_X8=1 where the driver offers XMX, =2 with the DPAS emulated by DP4a dot products on any GPU
+  // with 8-lane sub-groups (tests: the 125H). The same start-up check against attn_q8; ARC_ATTN_X8_WG="NT,NH" (heads of
+  // more than 128 dims take two sub-groups a token group: at most 32 sub-groups in all); ARC_ATTN_FX_PF and
+  // ARC_ATTN_FX_DEFS apply to it too
+  std::string attnfx_src_, attnx8_src_;
   cl_kernel k_attn_fx_ = nullptr;
   int fx_nt_ = 0, fx_nh_ = 0;
+  bool fx_x8_ = false;  // (k_attn_fx_ is attn_x8)
+  static int attnx8_mode() {
+    static const int e = getenv("ARC_ATTN_X8") ? atoi(getenv("ARC_ATTN_X8")) : 0;
+    return e == 1 || e == 2 ? e : 0;
+  }
+  // (=1 on an iGPU only where XMX passed its start-time checks (xmx_), as attnfx_wanted: a 140T whose check failed,
+  //  e.g. with an old driver, keeps attn_q8; the Researcher's audit half, 2026-11-21. =2: DPAS emulated, tests)
+  bool attnfx8_on() const {
+    return cl_.sg8 && (attnx8_mode() == 2 || (attnx8_mode() == 1 && cl_.xmx && (xmx_ || !zrt::integrated())));
+  }
   bool attnfx_wanted() const {
     static const int e = getenv("ARC_ATTN_FX") ? (atoi(getenv("ARC_ATTN_FX")) != 0 ? 1 : 0) : -1;
     // (on by default on discrete cards, and on iGPUs with 16-lane XMX since 2026-11-17: a B390's 27B 4K prompt attention
-    //  377 -> 160 ms, issue #1; the 140T, 8 lanes, never takes it)
+    //  377 -> 160 ms, issue #1; GPUs with 8-lane DPAS only through ARC_ATTN_X8, attn_x8)
     // (an iGPU only where XMX passed its start-time checks, speed included (xmx_): one whose check kept DP4a runs the
     //  GPU's own defaults; audit 2026-11-17)
     const bool on = e < 0 ? (!zrt::integrated() || (cl_.xmx && !cl_.sg8 && xmx_)) : e == 1;
     const int hd = hp.qwen3 ? hp.head_dim : 256;
-    return on && cl_.xmx && !cl_.sg8 && !hp.gemma && !hp.swa_rings && hd % 32 == 0 && hd <= 256 && !attn_q8_defs_.empty();
+    const bool model = !hp.gemma && !hp.swa_rings && hd % 32 == 0 && hd <= 256 && !attn_q8_defs_.empty();
+    if (cl_.sg8) return e != 0 && attnfx8_on() && model;
+    return on && cl_.xmx && model;
   }
   std::string attnfx_defs() const {
     const int hd = hp.qwen3 ? hp.head_dim : 256, hpg = hp.n_head / hp.n_head_kv;
     static const bool pf = !getenv("ARC_ATTN_FX_PF") || atoi(getenv("ARC_ATTN_FX_PF")) != 0;
     // (ARC_ATTN_FX_DEFS: further -D options for the kernel's variants, tests)
     static const std::string extra = getenv("ARC_ATTN_FX_DEFS") ? std::string(" ") + getenv("ARC_ATTN_FX_DEFS") : "";
+    const std::string pfd = fx_x8_ ? (pf ? " -DX8_PF" : "") + std::string(attnx8_mode() == 2 ? " -DX8_EMU" : "")
+                                   : (pf ? " -DFX_PF" : "");
     return "-cl-intel-256-GRF-per-thread -DHD=" + std::to_string(hd) + " -DHPG=" + std::to_string(hpg) +
-           " -DNT=" + std::to_string(fx_nt_) + " -DNH=" + std::to_string(fx_nh_) + (pf ? " -DFX_PF" : "") + extra;
+           " -DNT=" + std::to_string(fx_nt_) + " -DNH=" + std::to_string(fx_nh_) + pfd + extra;
   }
+  const char* attnfx_which() const { return fx_x8_ ? "attnx8" : "attnfx"; }
+  const char* attnfx_name() const { return fx_x8_ ? "attn_x8" : "attn_fx"; }
   void attnfx_init() {
     if (!attnfx_wanted()) return;
     const int hpg = hp.n_head / hp.n_head_kv;
-    // (32 sub-groups, every thread slot of an Xe-core with 256 registers; two q heads where the GQA ratio is even: a
-    //  B70's 27B 16K prompt, attention 965 ms at 4 x 6, 772 at 5 x 6, 707 at 16 x 2, 710 at 32 x 1)
-    int nh = hpg % 2 == 0 ? 2 : 1, nt = 32 / nh;
-    if (const char* e = getenv("ARC_ATTN_FX_WG")) sscanf(e, "%d,%d", &nt, &nh);
+    fx_x8_ = cl_.sg8;
+    // (attn_x8: two sub-groups a token group for heads of more than 128 dims)
+    const int ds = fx_x8_ && (hp.qwen3 ? hp.head_dim : 256) > 128 ? 2 : 1;
+    // (attn_fx: 32 sub-groups, every thread slot of an Xe-core with 256 registers; two q heads where the GQA ratio is
+    //  even: a B70's 27B 16K prompt, attention 965 ms at 4 x 6, 772 at 5 x 6, 707 at 16 x 2, 710 at 32 x 1.
+    //  attn_x8, not measured yet: all q heads of a KV head in one work-group (with two sub-groups a token group they
+    //  run in step, and token groups added run the last one's spans), 16 sub-groups)
+    const int cap = 32 / ds;
+    int nh = fx_x8_ ? hpg : hpg % 2 == 0 ? 2 : 1, nt = fx_x8_ ? std::max(1, 16 / (nh * ds)) : 32 / nh;
+    if (const char* e = getenv(fx_x8_ ? "ARC_ATTN_X8_WG" : "ARC_ATTN_FX_WG")) sscanf(e, "%d,%d", &nt, &nh);
     if (nh < 1 || hpg % nh) nh = hpg;
-    while (nh > 1 && nt * nh > 32) {  // (at most 32 sub-groups: the largest divisor of the GQA ratio that fits)
+    while (nh > 1 && nt * nh > cap) {  // (at most 32 sub-groups: the largest divisor of the GQA ratio that fits)
       int d = nh - 1;
       while (hpg % d) --d;
       nh = d;
     }
-    if (nt < 1 || nt * nh > 32) nt = std::max(1, 32 / nh);
+    if (nt < 1 || nt * nh > cap) nt = std::max(1, cap / nh);
     fx_nt_ = nt, fx_nh_ = nh;
     static std::mutex mu;
     static std::map<std::string, double> known;  // (-1: failed)
@@ -399,14 +495,16 @@
       const double d = nocheck ? 0.0 : attnfx_check();
       it = known.emplace(key, d).first;
       if (d >= 0)
-        zlog::eprintf("inferzero: prompt attention as flash attention on XMX (attn_fx, %d x 8 tokens x %d heads a work-group; "
-                      "against attn_q8: max difference %.1e of the output range)\n", nt, nh, d);
+        zlog::eprintf("inferzero: prompt attention as flash attention on XMX (%s%s, %d x 8 tokens x %d heads a work-group; "
+                      "against attn_q8: max difference %.1e of the output range)\n", attnfx_name(),
+                      fx_x8_ && attnx8_mode() == 2 ? ", DPAS emulated: tests" : "", nt, nh, d);
     }
-    if (it->second >= 0) k_attn_fx_ = kernel("attnfx", attnfx_defs(), "attn_fx");
+    if (it->second >= 0) k_attn_fx_ = kernel(attnfx_which(), attnfx_defs(), attnfx_name());
   }
-  // gws / lws of attn_fx for T tokens and nkv KV heads
+  // gws / lws of attn_fx (attn_x8) for T tokens and nkv KV heads
   void attnfx_grid(int T, int nkv, size_t gws[2], size_t lws[2]) const {
-    const int hpg = hp.n_head / hp.n_head_kv, tq = 8 * fx_nt_, lsz = 16 * fx_nt_ * fx_nh_;
+    const int hd = hp.qwen3 ? hp.head_dim : 256, ds = fx_x8_ && hd > 128 ? 2 : 1;
+    const int hpg = hp.n_head / hp.n_head_kv, tq = 8 * fx_nt_, lsz = (fx_x8_ ? 8 * ds : 16) * fx_nt_ * fx_nh_;
     gws[0] = (size_t)(T + tq - 1) / tq * lsz, gws[1] = (size_t)nkv * (hpg / fx_nh_);
     lws[0] = (size_t)lsz, lws[1] = 1;
   }
@@ -424,8 +522,10 @@
     cl_.soft_fail = true;
     double worst = 0;
     try {
-      const struct { int M, p0, cap; } cases[2] = {{40, 0, 48}, {45, 27, 80}};
-      for (const auto& c : cases) {
+      // (attn_x8 also a third: 77 tokens at 150 over 256 slots, token groups of a work-group past M_valid)
+      const struct { int M, p0, cap; } cases[3] = {{40, 0, 48}, {45, 27, 80}, {77, 150, 256}};
+      for (int ci = 0; ci < (fx_x8_ ? 3 : 2); ++ci) {
+        const auto& c = cases[ci];
         const int nbc = c.cap / 16, blk_u = 4 * hd;
         std::vector<uint32_t> qi((size_t)c.M * nh * hd / 4), kq((size_t)nbc * blk_u), vq((size_t)nbc * blk_u);
         for (auto& v : qi) v = rnd();
@@ -440,7 +540,7 @@
         std::vector<float> res[2];
         for (int x = 0; x < 2; ++x) {
           const cl_mem bo = mk(out.data(), out.size() * 4);
-          cl_kernel k = x == 0 ? k_attn_q8_ : kernel("attnfx", attnfx_defs(), "attn_fx");
+          cl_kernel k = x == 0 ? k_attn_q8_ : kernel(attnfx_which(), attnfx_defs(), attnfx_name());
           int cx = c.cap, nn = nh, p0 = c.p0, mm = c.M, win = 0, nlo = -1, nhi = -1;
           set_args(k, 0, bq, bqs, bk, bks, bv, bvs, cx, nn, p0, mm, bo, win, nlo, nhi);
           size_t gws[2] = {(size_t)(c.M + tpw - 1) / tpw * 512, 1}, lws[2] = {512, 1};
@@ -458,15 +558,15 @@
         worst = std::max(worst, mref > 0 ? mdiff / mref : 1e30);
       }
       if (worst > tol) {
-        zlog::eprintf("inferzero: attn_fx differs from attn_q8 by %.2e of the output range (more than %.0e): attn_q8 "
-                      "(please report)\n", worst, tol);
+        zlog::eprintf("inferzero: %s differs from attn_q8 by %.2e of the output range (more than %.0e): attn_q8 "
+                      "(please report)\n", attnfx_name(), worst, tol);
         worst = -1;
       }
     } catch (const zrt::GpuWaitError&) {
       for (cl_mem& m : bufs) free_buf(m);
       throw;
     } catch (const std::exception& e) {
-      zlog::eprintf("inferzero: attn_fx does not build here (%s): attn_q8\n", e.what());
+      zlog::eprintf("inferzero: %s does not build here (%s): attn_q8\n", attnfx_name(), e.what());
       worst = -1;
     }
     for (cl_mem& m : bufs) free_buf(m);

@@ -79,6 +79,27 @@
     clGetDeviceInfo(cl_.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(v), &v, nullptr);
     return v;
   }
+  // Whether this engine's GPU memory fits the GPU's share less the driver's part, and the largest context (a multiple
+  // of 1024, up to the one it has) that would: everything it holds but the context, plus the context's bytes (KV
+  // caches, QSA keys, each slot's), at that length. The same count for every mode: with --mtp the MTP block, its KV
+  // rows and the draft buffers are in gpu_bytes and in ctx_bytes / slot_bytes, so it is counted as plain is
+  // (2026-11-21, issue #45: one --ctx check for runz and the server; 0 when not even 1024 tokens fit)
+  bool fits_share() const { return (double)gpu_bytes <= (double)device_mem() - driver_slack(); }
+  // (the weights plan_tight put in host memory count as the GPU's here: at a smaller context it keeps fewer of them
+  //  there, so the GPU's total falls by less than the context's bytes. Without them the first suggestion was not a
+  //  fit: skipzx-lab's A770, the 27B --mtp --chunk 1024, 92,752 -> "73,728 fits" -> 15.17 GiB, three steps to 53,248;
+  //  issue #45, release .21.13. The suggestion is the largest context with every weight on the GPU, where plan_tight
+  //  moves none: one step)
+  int max_fitting_ctx() const {
+    const double lim = (double)device_mem() - driver_slack();
+    const int s = slot_count();
+    const double base = (double)gpu_bytes + (double)host_weight_bytes() - (double)ctx_bytes(ctx) -
+                        (double)(s - 1) * (double)slot_bytes(ctx);
+    int best = 0;
+    for (int c = 1024; c <= ctx; c += 1024)
+      if (base + (double)ctx_bytes(c) + (double)(s - 1) * (double)slot_bytes(c) <= lim) best = c;
+    return best;
+  }
 
   // The first position rewind() accepts (swa_rings): the sliding-window rings must still hold the n_swa positions before it.
   int rewind_floor() const {
@@ -278,7 +299,8 @@
       batch_.push_back({slots[b], b, 1, h.pos, h.rope_shift});
     }
     const int Mp = 16;
-    embed(toks.data(), B, Mp);
+    if (pp_first()) embed(toks.data(), B, Mp);
+    else pp_load(0, B, Mp, x_);  // (a layer split's later stage: the stage before's rows, zero/mgpu/engine_pp.h)
     // (DFlash2: every row's features go to the first accumulator; each slot's ring takes its row below)
     pos = 0;
     dfl_cap_lo_ = dfl_cap_base_ = 0;
@@ -287,11 +309,16 @@
     fail_point();
     const std::vector<BatchSeq> seqs = batch_;
     batch_.clear();
-    head_rows(0, B, out_norm_, nullptr);
-    if (batch_logits_host_.size() < (size_t)hp.n_vocab * B) batch_logits_host_.resize((size_t)hp.n_vocab * batch_rows_);
-    // (rows of n_logits(): the vocabulary, or a split model's shard of it)
-    CL_CHECK(clEnqueueReadBuffer(cl_.queue, logits_, CL_TRUE, 0, (size_t)n_logits() * B * 4, batch_logits_host_.data(), 0,
-                                 nullptr, nullptr));
+    if (pp_last()) {
+      head_rows(0, B, out_norm_, nullptr);
+      if (batch_logits_host_.size() < (size_t)hp.n_vocab * B) batch_logits_host_.resize((size_t)hp.n_vocab * batch_rows_);
+      // (rows of n_logits(): the vocabulary, or a split model's shard of it)
+      CL_CHECK(clEnqueueReadBuffer(cl_.queue, logits_, CL_TRUE, 0, (size_t)n_logits() * B * 4, batch_logits_host_.data(), 0,
+                                   nullptr, nullptr));
+    } else {  // (a stage before the last: its rows to the next one, no head)
+      pp_out_->assign((size_t)B * hp.hce(), 0.0f);
+      pp_save(0, B, x_);
+    }
     for (const BatchSeq& q : seqs) {
       point_to(q.slot);
       pos = q.pos;

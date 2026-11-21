@@ -569,6 +569,39 @@ inline void dequant_row(uint32_t type, const uint8_t* row, int K, float* out) {
     }
     return;
   }
+  // (Q4_1, Q5_0, Q8_1: no GPU kernel; decoded here and stored as Q8_0 at load, zero/engine_load.h make_weight. QUEUE
+  //  Q2, 2026-11-21; the block layouts are ggml's)
+  if (type == GGML_Q4_1) {  // blocks of 32: f16 scale, f16 min, low nibbles = elements 0..15, high = 16..31
+    for (int b = 0; b < K / 32; ++b) {
+      const uint8_t* p = row + (size_t)b * 20;
+      const float d = fp16_to_f32(rd16(p)), m = fp16_to_f32(rd16(p + 2));
+      for (int j = 0; j < 16; ++j) {
+        out[b * 32 + j] = d * (float)(p[4 + j] & 0x0F) + m;
+        out[b * 32 + 16 + j] = d * (float)(p[4 + j] >> 4) + m;
+      }
+    }
+    return;
+  }
+  if (type == GGML_Q5_0) {  // blocks of 32: f16 scale, 32 high bits, nibbles as Q4_0; value (q - 16) * d
+    for (int b = 0; b < K / 32; ++b) {
+      const uint8_t* p = row + (size_t)b * 22;
+      const float d = fp16_to_f32(rd16(p));
+      const uint32_t high = rd32(p + 2);
+      for (int j = 0; j < 32; ++j) {
+        const int low = (p[6 + j % 16] >> (j < 16 ? 0 : 4)) & 15;
+        out[b * 32 + j] = d * (float)((int)(low | (((high >> j) & 1) << 4)) - 16);  // (int: the uint32 wrapped below 0)
+      }
+    }
+    return;
+  }
+  if (type == GGML_Q8_1) {  // blocks of 32: f16 scale, f16 sum (not needed here), 32 int8
+    for (int b = 0; b < K / 32; ++b) {
+      const uint8_t* p = row + (size_t)b * 36;
+      const float d = fp16_to_f32(rd16(p));
+      for (int j = 0; j < 32; ++j) out[b * 32 + j] = d * (float)(int8_t)p[4 + j];
+    }
+    return;
+  }
   if (type == GGML_Q5_1) {  // Rows may end after any 32-element block (Flash Next down: K = 640).
     for (int b = 0; b < K / 32; ++b) {
       const uint8_t* p = row + (size_t)b * 24;
@@ -621,6 +654,22 @@ inline void dequant_row(uint32_t type, const uint8_t* row, int K, float* out) {
   }
 }
 
+// Rows of any type dequant_row reads, as Q8_0, 1,024 rows at a time: the same bytes as decoding the whole matrix and
+// quantizing it (each Q8_0 row stands alone), at a peak of ~1,024 x K floats instead of N x K (a vocab-sized output head
+// of 248,320 x 5,120 was 5.1 GB at once; the Researcher's review, 2026-11-21). row_bytes: the source's bytes a row
+inline std::vector<uint8_t> requant_rows_q8_0(uint32_t type, const uint8_t* data, size_t row_bytes, int N, int K) {
+  const int R = 1024;
+  std::vector<uint8_t> out;
+  out.reserve((size_t)N * (K / 32) * 34);
+  std::vector<float> f((size_t)std::min(N, R) * K);
+  for (int n0 = 0; n0 < N; n0 += R) {
+    const int n = std::min(R, N - n0);
+    for (int r = 0; r < n; ++r) dequant_row(type, data + (size_t)(n0 + r) * row_bytes, K, f.data() + (size_t)r * K);
+    const std::vector<uint8_t> q = quantize_rows_q8_0(f.data(), n, K);
+    out.insert(out.end(), q.begin(), q.end());
+  }
+  return out;
+}
 // CPU version of the activation quantizer (must match zero/kernels/ops.cl quant_store16): int8 with absmax scale
 // per 256 elements (asc [K/256][M]) or per 32 (act32: asc [K/32][M]); absum [K/16][M] = sums per 16.
 inline void quantize_act_cpu(const float* x, int M, int K, int8_t* aq, float* asc, uint16_t* absum, bool act32 = false) {

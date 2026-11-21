@@ -16,6 +16,7 @@
 #include "../src/json.h"
 #include "../src/load_progress.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <climits>  // (INT_MAX in the parts below: GCC 16's libstdc++ no longer brings it in through other headers, issue #27)
 #include <deque>
@@ -24,6 +25,11 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <cstdlib>
+#include <cstring>
+#ifndef _WIN32
+extern char** environ;  // (the ARC_* switches in the warm-up marker: Engine::warm_key_extra)
+#endif
 
 struct GpuWeight {
   uint32_t type = 0;  // GGUF type of the raw rows (BF16/F16/F32 matrices are requantized to Q8_0)
@@ -33,6 +39,12 @@ struct GpuWeight {
   cl_mem wq = nullptr, wh = nullptr;  // resident GEMM form (W8, or repacked Q8_0); null = decode just in time
   int gemm_qtype = 0;                 // zero/kernels/gemm.cl QTYPE
   int role = 0;                       // just-in-time W8 staging slot (one per matrix role within a layer)
+  // (matmul1's one-token GEMV, chosen at its first launch and kept: a launch builds no kernel key, ~6 strings, and
+  //  looks nothing up, ~330 times a token; a split model's shard threads shared the heap's lock for them on Windows,
+  //  issue #4, 2026-11-21. g1k[q2_fuse_]; guk: gemv_gu's gate + up kernel, on the gate's weight. The same kernels)
+  mutable cl_kernel g1k[2] = {nullptr, nullptr}, guk = nullptr;
+  mutable int g1rows = 0, gurows = 0;
+  mutable bool g1vk = false, guvk = false;
 };
 
 struct Hparams {
@@ -84,6 +96,10 @@ struct EngineOptions {
   int mtp_drafts = 0;         // drafts per step (1..7; later ones chained on the MTP block's own output); 0 = auto:
                               // 3 for wide dense Qwen models (27B: code 7.8 -> 9.5 tok/s, text +2.5 %), else 2
   float mtp_min_p = 0.5f;     // draft a second token only if the MTP block gives the first this probability
+  // copy drafting (QUEUE R1, 2026-11-21, opt-in): with mtp, a step whose last tokens appeared earlier in the context
+  // drafts the tokens that followed them there instead of asking the drafter (mtp_draft's hist); verified as any drafts,
+  // so the output stays the same. ARC_COPY_DRAFT=1 sets it too
+  bool copy_draft = false;
   std::string mtp_model;      // Gemma 4: assistant drafter GGUF (empty: an mtp-*.gguf next to the model, if any)
   // (a mtp_model that is not this model's head or drafter: false (runz) an error, true (the server, which may switch to
   //  another model) a line saying so, and the head or drafter next to the model as without it. Audit 2026-11-17)
@@ -110,6 +126,10 @@ struct EngineOptions {
   int npu = -1;
   // tensor parallel (zero/engine_tp.h, --gpus): this engine is shard tp_rank of a model split over tp_size GPUs
   int tp_rank = 0, tp_size = 1;
+  // a layer split (zero/mgpu/engine_pp.h, --split layer): this engine is a stage holding the layers [pp_begin, pp_end)
+  // only; the first stage embeds, the last has the norm, the head and the MTP block; -1: every layer (no split)
+  int pp_begin = 0, pp_end = -1;
+  int pp_size = 1;  // (the split's stage count: under ARC_TP_SIM a stage's memory checks take GPU 0's divided by it)
   // weights in host memory (iGPU: the same DRAM, read at ~91 % of device memory's speed, not counted in the GPU share),
   // GiB: < 0 automatic (a dense model whose weights fill more than 85 % of the share: Gemma 4 31B), 0 none
   double host_weights_gb = -1;
@@ -314,8 +334,9 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     adopt_mtp_file();  // (Flash Next's MTP head in a file of its own: before anything keeps a pointer into f_)
     load_hparams();
     // Flash Next precision includes attention: per-row int8 Q/K/V can amplify small errors through routing.
-    if (hp.hc && fn_precise()) opt.attn_int8 = false;
-    if (mtp_ext_) {  // (its layer, il = n_layer: full attention, QSA with the file's compress ratio)
+    if (hp.hc && (fn_precise() || fn_kv16())) opt.attn_int8 = false;
+    // (Flash Next only: a qwen35 head borrowed from the base model, PR #68, has no QSA)
+    if (mtp_ext_ && mtp_file_->get_str("general.architecture") == "qwen4exp") {  // (its layer, il = n_layer: full attention, QSA with the file's compress ratio)
       hp.qsa_ratio.resize(hp.n_layer + 1, 0);
       const auto* cr = mtp_file_->get_ints("qwen4exp.attention.compress_ratios");
       if (cr && (int)cr->size() > hp.n_layer && f_.find("blk." + std::to_string(hp.n_layer) + ".indexer.k_proj.weight")) {
@@ -359,7 +380,25 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     //  reports ~11.3 GiB (a B580: 11.33), so the line is 11 GiB; it was 12 GiB until the self audit of 2026-11-19, which
     //  left the 12 GB cards at 512)
     const bool res_long = !zrt::integrated() && zrt::D().global_mem >= (11ull << 30);
-    max_chunk = o.chunk > 0 ? o.chunk : hp.ds41 ? 1024 : stream_ ? (hp.hc || hp.gemma ? 2048 : 8192) : hp.moe ? 2048 : tight_ ? 1024 : (w8_resident && !res_long ? 512 : 4096);
+    // (2026-11-20, the user: "i want to chunk size to keep it at 4096 so no bigger chunk size": 4096 the streamed MoE
+    //  models' chunk and the ceiling. Flash Next 2048 -> 4096 where the GPU has 15 GiB or more: a Pro B70's 4K / 16K
+    //  prompt 1,150 / 1,110 -> 1,257 / 1,216 tok/s (+9 %), its expert cache 23.35 -> 22.53 GiB (joshdev-de, issue #27);
+    //  the laptop's 4K 156 -> 164, generation after 5.3 -> 5.8; KL against f32 on 3,584 tokens the same at both (default
+    //  0.00894, precise 0.00583). The other streamed MoE models 8192 -> 4096 (the laptop's 35B at 32K: 604 -> 533 tok/s in
+    //  QUEUE 19.4's sweep, its cache 77 -> 81 %). Gemma 4 keeps 2048 (its 4096 measured slower above))
+    // (discrete cards from 20 GiB since 2026-11-20, the user: "keep the faster one". An A770 16 GB (skipzx-lab, #57,
+    //  Linux, 150 W): 4096 against 2048 the prompt only +3-6 % (16K 517 -> 535 tok/s) but generation after it 15.1 / 15.2
+    //  -> 13.3 / 12.8 tok/s at 16K / 32K (-12-16 %), its expert cache 16 -> 14 %; a B60 24 GB: prompt +10 %, generation
+    //  -2 %. So 16 GB cards (A770, Pro B50, the B580's 12) keep 2048; iGPUs keep the 15 GiB line, as measured on the
+    //  laptop above)
+    // (a split model keeps 4096 on any card, since 2026-11-20: hansong80's two A770s 16 GB (#45, .20.03), Flash Next
+    //  IQ3_S at 2048 / 4096, prompt 465.9 / 466.3 -> 527.0 / 528.3 tok/s (+13 %), generation 12.17 / 12.76 -> 13.13 /
+    //  13.43 (+5 %): a chunk's sums go through the split, 192 at 2048 against 96 at 4096, so the smaller chunk pays them
+    //  twice; one card has none, and 2048 wins there. The user's "keep the faster one")
+    const bool fn_4k = o.tp_size > 1 || zrt::D().global_mem >= (zrt::integrated() ? (15ull << 30) : (20ull << 30));
+    // (the user, 2026-11-20: "Yes, 4096 for all", then "gemma4 2048 then": a MoE model with every expert on the GPU
+    //  (the 35B-A3B on a B60 / B70) 2048 -> 4096 too, Gemma 4 2048 either way)
+    max_chunk = o.chunk > 0 ? o.chunk : hp.ds41 ? 1024 : stream_ ? (hp.gemma ? 2048 : hp.hc ? (fn_4k ? 4096 : 2048) : 4096) : hp.moe ? (hp.gemma ? 2048 : 4096) : tight_ ? 1024 : (w8_resident && !res_long ? 512 : 4096);
     max_chunk = (std::max(max_chunk, o.min_chunk) + 127) / 128 * 128;
     q2_init();
     // (also in a dry run, --ctx auto's memory plan: H8's buffers and the float copy in aq_ are counted then; self audit
@@ -377,6 +416,7 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     //  the start-time speed check on its small shape had picked XMX. Off, the GPU runs as with ARC_NO_XMX)
     //  (discrete cards with 8-lane DPAS, the Alchemist A-series: XMX checked, then timed on a model-sized GEMM in
     //  xmx_check as an iGPU is; no one has measured gemm_x8 on one. Self audit 2026-11-08: the gate had caught them too)
+    if (!opt.dry) gemm_self_check();  // (W3: the DP4a GEMM against the CPU, a bad driver; zero/engine_setup.h)
     const bool xmx_force = getenv("ARC_XMX_FORCE") && atoi(getenv("ARC_XMX_FORCE")) != 0;
     const bool sg8_igpu = cl_.sg8 && zrt::integrated();
     if (!opt.dry && cl_.xmx && sg8_igpu && !xmx_force && !p140_ && !getenv("ARC_XMX_TRY")) {
@@ -454,8 +494,10 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     }
     if (p140_) {
       static std::once_flag said;
-      std::call_once(said, [] {
-        zlog::eprintf("inferzero: Arc 140T preset: XMX + H8 for prompt chunks of %d+ tokens, DP4a below (ARC_140T=0: off)\n", kP140Min);
+      const bool res = p140_res_;
+      std::call_once(said, [res] {
+        zlog::eprintf("inferzero: Arc 140T preset: XMX + H8 for prompt chunks of %d+ tokens, %s DP4a below (ARC_140T=0: off)\n",
+                      p140_min(res), res ? "resident" : "just-in-time");
       });
     }
     if (!opt.dry) x16_init();  // (the f16 XMX prompt GEMM: zero/xe2/engine_xe2.h)
@@ -497,7 +539,7 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     //  18 Oct (docs/speed-progress.md): 35B UD-IQ4_XS at 131K keeps 81 % of the experts and answers as fast as at
     //  64K; Flash Next loses 2-6 % from 32K to 131K.)
     if (stream_ && opt.dry) {
-      const double left = (double)device_mem() / (tp_on() && getenv("ARC_TP_SIM") ? opt.tp_size : 1) - driver_slack() -
+      const double left = (double)device_mem() / (tp_on() && getenv("ARC_TP_SIM") ? opt.tp_size : opt.pp_size > 1 && getenv("ARC_TP_SIM") ? opt.pp_size : 1) - driver_slack() -
                           (double)gpu_bytes + (double)ctx_bytes(ctx) -
                           (double)snapshot_bytes() - (double)opt.stream_reserve;
       // (--slots N: 128K of context in all, each slot 128K / N; the floor of 3/4 only as far as it leaves every slot
@@ -552,8 +594,31 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
   }
 
   // Feeds tokens at the current position; returns the logits for the last token.
+  // ---- a layer split's stage (opt.pp_begin / pp_end, zero/mgpu/engine_pp.h): a stage after the first takes each
+  // chunk's rows from pp_in_ (the stage before's, row t of the call at t * hce floats) instead of the embedding, and a
+  // stage before the last writes its rows to pp_out_ instead of running the head (forward then returns no logits).
+  // The rows past T to Mp are zero, as embed() leaves them: a row's sums never read another row's
+  int pp_base_ = 0;  // (forward_layer_major's segment: its first row of the call)
+  bool pp_first() const { return opt.pp_begin <= 0; }
+  bool pp_last() const { return opt.pp_end < 0 || opt.pp_end >= hp.n_layer; }
+  const float* pp_in_ = nullptr;
+  std::vector<float>* pp_out_ = nullptr;
+  void pp_load(int t0, int T, int Mp, cl_mem dst) {
+    cur_T_ = T;
+    attn_in_ready_ = ffn_in_ready_ = false;
+    const size_t W = hp.hce();
+    std::fill(x_host_.begin(), x_host_.begin() + (size_t)Mp * W, 0.0f);
+    std::copy(pp_in_ + (size_t)t0 * W, pp_in_ + (size_t)(t0 + T) * W, x_host_.begin());
+    CL_CHECK(clEnqueueWriteBuffer(cl_.queue, dst, CL_TRUE, 0, (size_t)Mp * W * 4, x_host_.data(), 0, nullptr, nullptr));
+  }
+  void pp_save(int t0, int T, cl_mem src) {
+    const size_t W = hp.hce();
+    CL_CHECK(clEnqueueReadBuffer(cl_.queue, src, CL_TRUE, 0, (size_t)T * W * 4, pp_out_->data() + (size_t)t0 * W, 0, nullptr,
+                                 nullptr));
+  }
   const std::vector<float>& forward(const int* tokens, int n) {
     TP_MIRROR(forward(tokens, n), TpMirror::kLogits, 0);
+    if (!pp_last()) pp_out_->assign((size_t)n * hp.hce(), 0.0f);  // (a stage before the last: its rows, not logits)
     if (pos + n > ctx) throw std::runtime_error("context overflow");
     if (has_mtp) flush_mtp_pending();
     if (hp.ple_layer >= 0) ple_sync();
@@ -564,9 +629,10 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
       prog_total_ = n;
       for (int s0 = 0; s0 < n; s0 += lm_seg_) {
         prog_base_ = s0;
+        pp_base_ = s0;  // (a layer split's stage: this segment's first row of pp_in_ / pp_out_)
         const auto& l = forward_layer_major(tokens + s0, std::min(lm_seg_, n - s0));
         if (s0 + lm_seg_ >= n) {
-          prog_base_ = prog_total_ = 0;
+          prog_base_ = prog_total_ = pp_base_ = 0;
           return l;
         }
       }
@@ -587,7 +653,8 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
       const int Mp = T >= 128 ? std::min((T + 127) / 128 * 128, max_chunk) : (T + 15) / 16 * 16;
       if (by_layer) keep_block();
       ring_guard(T);  // (Gemma: a snapshot's rings' window copied before this chunk overwrites it)
-      embed(tokens + c0, T, Mp);
+      if (pp_first()) embed(tokens + c0, T, Mp);
+      else pp_load(c0, T, Mp, x_);  // (a layer split's later stage: the stage before's rows)
       media_pos(tokens + c0, T);
       for (auto& L : layers_) {
         run_layer(L, T, Mp);
@@ -595,9 +662,19 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
       }
       pos += T;
       x_rows_ = T;
+      if (!pp_last()) {  // (an earlier stage: its rows to the next one, no head)
+        pp_save(c0, T, x_);
+        if (profile) collect_profile();
+        continue;
+      }
       if (mtp_block_) mtp_prefill(tokens + c0, T, Mp, pos - T);
       if (c0 + T >= n) head(T);
       if (profile) collect_profile();
+    }
+    if (!pp_last()) {
+      static const std::vector<float> none;
+      collect_profile();
+      return none;
     }
     CL_CHECK(clEnqueueReadBuffer(cl_.queue, logits_, CL_TRUE, 0, (size_t)n_logits() * 4, logits_host_.data(), 0,
                                  nullptr, nullptr));
@@ -630,7 +707,8 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     for (int c = 0; c < nch; ++c) {
       x_ = x_views_[c];
       if (!ple_views_.empty()) ple_emb_ = ple_views_[c];
-      embed(tokens + (size_t)c * max_chunk, chunk_T(c), chunk_Mp(c));
+      if (pp_first()) embed(tokens + (size_t)c * max_chunk, chunk_T(c), chunk_Mp(c));
+      else pp_load(pp_base_ + c * max_chunk, chunk_T(c), chunk_Mp(c), x_views_[c]);  // (a layer split's later stage)
     }
     // (set_media's rotary positions: the segment's rows written once, each chunk reads its part; every write syncs)
     struct NoRpos { int& u; cl_mem& p; cl_mem s; ~NoRpos() { u = 0; p = s; } } no_rpos{use_rpos_, rpos_, rpos_};
@@ -673,6 +751,14 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     }
     tpo_end();
     pos = pos0 + n;
+    if (!pp_last()) {  // (a layer split's earlier stage: every chunk's rows to the next stage, no head)
+      for (int c = 0; c < nch; ++c) pp_save(pp_base_ + c * max_chunk, chunk_T(c), x_views_[c]);
+      x_ = x_views_[nch - 1];
+      cur_T_ = chunk_T(nch - 1);
+      x_rows_ = cur_T_;
+      static const std::vector<float> none;
+      return none;
+    }
     if (mtp_block_)
       for (int c = 0; c < nch; ++c) {
         x_ = x_views_[c];
@@ -787,20 +873,39 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
   std::function<bool()> cancel;
   struct Cancelled {};
 
+  // What else picks the kernels a warm-up builds, for its marker (warm_up_once): every ARC_* switch, sorted (many
+  // choose kernel variants: ARC_GEMV_WAVE_MT=0 builds other GEMVs, which a run after the default one's warm-up then
+  // compiled in its generation, a Pro B70's first Flash Next verification pass 543 ms against 128; issue #54), and the
+  // MTP head or drafter file (another head, other weight types: other kernels).
+  std::string warm_key_extra() const {
+#ifdef _WIN32
+    char** const env = _environ;
+#else
+    char** const env = environ;
+#endif
+    std::vector<std::string> arc;
+    for (char** e = env; e && *e; ++e)
+      if (std::strncmp(*e, "ARC_", 4) == 0) arc.emplace_back(*e);
+    std::sort(arc.begin(), arc.end());
+    std::string s = "|head=" + (mtp_file_ ? mtp_file_->path : opt.mtp_model);
+    for (const auto& kv : arc) s += "|" + kv;
+    return s;
+  }
+
   const GgufFile& gguf() const { return f_; }
   // Runs the generation kernels once so that a first request does not wait for their just-in-time compilation: a
   // short prompt and a token, then with MTP / DFlash2 drafts and a verification pass of every row count (DFlash2 and
   // the MTP block each); leaves the engine reset. Only when this model, these options and these kernel sources have
-  // not been warmed before (a marker in the kernel cache, "w2": since the Gemma drafter is warmed too): after an update the first requests took seconds per new
+  // not been warmed before (a marker in the kernel cache, "w3": since the MTP block runs over every row count of its pending drafts too): after an update the first requests took seconds per new
   // kernel (27B with DFlash2: a 27-token prompt 37 s, then 1-3 tok/s), later starts skip it. Returns true when it ran.
   bool warm_up_once(int tok, bool prompt = true) {
     const std::string& dir = cl_.cache_dir;
     char hex[17];
     snprintf(hex, sizeof hex, "%016llx",
-             (unsigned long long)ClRt::fnv1a(gemm_src_ + "\x01" + ops_.all() + "\x01" + dec_.all() + "\x01" + moe_src_ + "\x01" + f_.path +
+             (unsigned long long)ClRt::fnv1a(gemm_src_ + "\x01" + ops_.all() + "\x01" + dec_.all() + "\x01" + moe_src_ + "\x01" + f_.path + warm_key_extra() +
                                              "|" + std::to_string(opt.mtp) + "|" + opt.dflash + (opt.mtp_block ? "" : "|nomtp") +
                                              "|" + std::to_string(opt.mtp_drafts) +
-                                             "|" + std::to_string(max_chunk) + "|" + cl_.device_id + "|w2"));
+                                             "|" + std::to_string(max_chunk) + "|" + cl_.device_id + "|w3"));
     const std::string marker = dir.empty() ? std::string() : dir + PLAT_SEP "warm-" + hex;
     // (every start (prompt = true): a prompt long enough for the large-chunk kernels (moe_rg from 320 rows), then a token: their first
     //  use in a process cost seconds even from the kernel cache; 35B with drafters, a first 1,749-token request 8.6 s
@@ -815,8 +920,13 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
       reset();
       return false;
     }
-    std::vector<int> t(nwarm, tok);
+    std::vector<int> t(std::max(nwarm, 8), tok);  // (the 2-8 row passes below read up to 8: a context under 20 made nwarm < 8)
     forward(t.data(), (int)t.size());
+    // (2 .. 8 rows: the multi-token GEMVs (TB = 2 / 4 / 7 / 8) of every weight type, which short prompts and the
+    //  server's batched steps of several slots run. Without them a Pro B70's serverz, 27B, after an update: a first
+    //  22-token request 35 s for 128 tokens (70 kernels compiled) against 3.9 s, the first round of 4 at once 19 s
+    //  (26 more) against 8.6; issue #54)
+    for (int n = 2; n <= 8 && pos + n + 1 < ctx; ++n) forward(t.data(), n);
     forward(&tok, 1);
     // (Gemma 4's drafter too, through the same calls, its code unchanged: an E4B first request after an update
     //  generated at 3.7 tok/s, its drafter and verification kernels compiling, the next ones at 26)
@@ -828,9 +938,14 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
           dfl_gap_ = 1 << 16;
           mtp_draft(tok, k);
           verify(tok, std::vector<int>(k, tok));
-          verify_done(0);
+          verify_done(k);  // (every draft accepted: the next draft pass runs the MTP block over k + 1 rows)
         }
       }
+      // (the MTP block over 2 .. max_drafts + 1 rows: its rows of the accepted drafts and the next token. With
+      //  verify_done(0) here it only ever ran on 1 row, and a head in a file of its own (Flash Next's Q8_0 mtp-*.gguf,
+      //  its own experts) compiled its 2-8 row kernels in the first real generation: a Pro B70, 11 kernels, drafting
+      //  18 s of a 20 s, 96-token answer (4.8 tok/s, 52.8 once built); issue #27, 2026-11-19)
+      if (pos + 2 < ctx) mtp_draft(tok, 1);
     }
     reset();
     dfl_ema_ = 4.0;
@@ -1065,14 +1180,17 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     // (Q6_K: every matrix, not only output heads: 27B MTP block FFN 63-67 -> 71-77 GB/s, attn_output 0.41 -> 0.34 ms,
     //  eh_proj 0.78 -> 0.61 ms; tiny matrices equal; 16 Oct)
   }
-  static int gemv_v_rows(const GpuWeight& w) {
+  int gemv_v_rows(const GpuWeight& w) const {
     // (tuning; 1-8 rows a sub-group. Audit 2026-11-12 #8: a negative value or one above the matrix's rows gave a grid
     //  of 0 and a launch skipped without a word, the output left as it was: such values are ignored, with a note)
-    static const int force = [] {
+    static const int force_env = [] {
       const int v = getenv("ARC_GVROWS") ? atoi(getenv("ARC_GVROWS")) : 0;
       if (v < 0 || v > 8) zlog::eprintf("inferzero: ARC_GVROWS=%d ignored (1-8)\n", v);
       return v >= 1 && v <= 8 ? v : 0;
     }();
+    // (a Data Center GPU Max: one row, as ARC_GVROWS=1; see xehpc_on in zero/xe2/engine_xe2.h)
+    static const bool gv_set = getenv("ARC_GVROWS") != nullptr;  // (once: this runs at every GEMV launch)
+    const int force = force_env ? force_env : !gv_set && xehpc_on() ? 1 : 0;
     // (a per-type rule tuned on single matrices repeated in bench/gemv_bench, e.g. IQ4_XS one row, IQ3_XXS four,
     // was no faster in the model, where each matrix streams once: 4.68 / 4.67 / 4.79 vs 4.68 / 4.51 / 4.65 tok/s)
     if (force && force <= w.N) return force;
@@ -1192,7 +1310,7 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     //  the 27B's --prof-gen over 32 tokens: gemm_down 395.7 -> 321.2 ms, gate / up 284.4 / 280.5 -> 273.0 / 272.7, qkv
     //  109.7 -> 104.4; 2 rows slower, 4 slower still (TheUniKian, issue #45, 2026-11-19). Bit-identical: a row's sums do
     //  not depend on its sub-group (the laptop's 8-lane path, the 27B's logits equal). ARC_GVROWS=N sets it)
-    //  Only where the kernels are not batched (ARC_BATCH off: Alchemist on Linux): with ARC_BATCH=64, the default on
+    //  Only where the kernels are not batched (ARC_BATCH off; Alchemist is batched by default on Windows and, since 2026-11-21, Linux): with ARC_BATCH=64, the default on
     //  Windows, the step is not bound by the kernels' time and the gain is gone (hansong80's A770, two rounds: unbatched
     //  12.62 -> 13.20 tok/s, +4.8 %; batched 21.40 -> 21.19, -0.6 %; issue #45)
     static const bool gvrows_env = getenv("ARC_GVROWS") != nullptr;
@@ -1209,14 +1327,21 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
         &g == &lm_head_ || &u == &lm_head_)
       return false;
     if (g.iq3t != u.iq3t) return false;  // (one kernel for both: one layout, ARC_IQ3S_TILE)
-    bool vk = false;
-    const int grows = gemv1_rows(g, vk);  // (matmul1's kernel and rows for one of the matrices)
-    if (g.N % grows) return false;  // (the up rows must start a sub-group of their own)
+    if (!g.guk) {
+      bool vk = false;
+      const int grows = gemv1_rows(g, vk);  // (matmul1's kernel and rows for one of the matrices)
+      g.gurows = grows;
+      g.guvk = vk;
+      if (g.N % grows) return false;  // (the up rows must start a sub-group of their own: never kernel'd)
+      g.guk = kernel("decode", xe2_gemv_grf() + "-DQT=" + std::to_string(g.type) + " -DGROWS=" + std::to_string(grows) +
+                                   head_defs(g) + (vk ? std::string() : xe2_gemv_pf()) + " -DGU2" + iq3t_def(g),
+                     vk ? "gemv_v" : "gemv");
+    }
+    const int grows = g.gurows;
+    const bool vk = g.guvk;
     int N = g.N, K = g.K, M = Mp, c_off = 0, a = 0;
     rd_bytes += raw_bytes(g) + raw_bytes(u);
-    cl_kernel k = kernel("decode", xe2_gemv_grf() + "-DQT=" + std::to_string(g.type) + " -DGROWS=" + std::to_string(grows) +
-                                       head_defs(g) + (vk ? std::string() : xe2_gemv_pf()) + " -DGU2" + iq3t_def(g),
-                         vk ? "gemv_v" : "gemv");
+    cl_kernel k = g.guk;
     set_args(k, 0, g.raw, N, K, tabs_, aq_, asc_, absum_, M, C, c_off, a, u.raw);
     const size_t sgs = (size_t)N / grows, l1 = vk ? 256 : xe2_gemv_wg(sgs);  // (the work-group of one matrix's launch)
     size_t g1 = (2 * sgs * 16 + l1 - 1) / l1 * l1;
@@ -1228,22 +1353,33 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     if (cur_T_ == 1) {
       // rows per sub-group: enough sub-groups for small N; very tall matrices (an lm_head of short rows) do better
       // with more sub-groups again (gemv1_rows)
-      bool vk = false;
-      const int grows = gemv1_rows(w, vk);
+      if (act32 && host_cpu_gemv(w, Mp, C, c_off, a)) {  // (a matrix in host memory, ARC_HOST_CPU=1: zero/xe2)
+        rd_bytes += raw_bytes(w);
+        return;
+      }
+      const int fz = q2_fuse_ ? 1 : 0;
+      if (!w.g1k[fz]) {
+        bool vk = false;
+        w.g1rows = gemv1_rows(w, vk);
+        w.g1vk = vk;
+        // (ARC_GV_PROBE=1 / 2: a measurement, not for use, the output is wrong. 1: gemv reads the weights and skips the
+        //  decode (bandwidth of the access pattern); 2: it decodes the row's first superblocks again and again, no
+        //  streaming (the decode's own speed). Compare the `gemm_gate / up / down` rows of --prof-gen. Every type on the
+        //  gemv path, not the output head; gemv_v's types (IQ3_XXS, IQ4_XS, IQ2, Q6_K) run as usual. Probe 1's
+        //  stand-in reads (stride 8 words across lanes) cost local-memory bank conflicts of their own: an upper bound)
+        static const int gv_probe = getenv("ARC_GV_PROBE") ? atoi(getenv("ARC_GV_PROBE")) : 0;
+        const std::string probe_def = gv_probe && !vk && &w != &lm_head_ ? " -DGV_PROBE=" + std::to_string(gv_probe) : std::string();
+        w.g1k[fz] = kernel("decode", xe2_gemv_grf() + "-DQT=" + std::to_string(w.type) + " -DGROWS=" + std::to_string(w.g1rows) +
+                                         head_defs(w) + probe_def + (q2_fuse_ ? " -DQ2F" + q2_defs_ : std::string()) +
+                                         (vk ? std::string() : xe2_gemv_pf()) + iq3t_def(w),
+                           vk ? "gemv_v" : "gemv");
+      }
+      const bool vk = w.g1vk;
+      const int grows = w.g1rows;
       int N = w.N, K = w.K, M = Mp;
       rd_bytes += raw_bytes(w);
-      if (act32 && host_cpu_gemv(w, M, C, c_off, a)) return;  // (a matrix in host memory, ARC_HOST_CPU=1: zero/xe2)
       if (q2_fuse_ && a > 1) throw std::logic_error(std::string("fused two-pass GEMV with an epilogue: ") + name);
-      // (ARC_GV_PROBE=1 / 2: a measurement, not for use, the output is wrong. 1: gemv reads the weights and skips the
-      //  decode (bandwidth of the access pattern); 2: it decodes the row's first superblocks again and again, no
-      //  streaming (the decode's own speed). Compare the `gemm_gate / up / down` rows of --prof-gen. Every type on the
-      //  gemv path, not the output head; gemv_v's types (IQ3_XXS, IQ4_XS, IQ2, Q6_K) run as usual. Probe 1's
-      //  stand-in reads (stride 8 words across lanes) cost local-memory bank conflicts of their own: an upper bound)
-      static const int gv_probe = getenv("ARC_GV_PROBE") ? atoi(getenv("ARC_GV_PROBE")) : 0;
-      const std::string probe_def = gv_probe && !vk && &w != &lm_head_ ? " -DGV_PROBE=" + std::to_string(gv_probe) : std::string();
-      cl_kernel k = kernel("decode", xe2_gemv_grf() + "-DQT=" + std::to_string(w.type) + " -DGROWS=" + std::to_string(grows) + head_defs(w) + probe_def +
-                                         (q2_fuse_ ? " -DQ2F" + q2_defs_ : std::string()) + (vk ? std::string() : xe2_gemv_pf()) + iq3t_def(w),
-                           vk ? "gemv_v" : "gemv");
+      cl_kernel k = w.g1k[fz];
       q2_fused_ = q2_fuse_;
       set_args(k, 0, w.raw, N, K, tabs_, aq_, asc_, absum_, M, C, c_off, a);
       // (gemv_v stages its tables with the first 64 items of a work-group: it keeps 256)
@@ -1683,7 +1819,7 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
 #include "xe2/engine_xe2.h"  // (tuning switches for GPUs with XMX, zero/xe2/; off on the iGPUs)
 #include "engine_h8.h"  // (H8 prompt GEMMs, QUEUE 31.12: Hadamard-rotated int8, ARC_H8=1)
 #include "xe2/engine_hostcpu.h"  // (the weights in host memory computed by the CPU for one token, ARC_HOST_CPU=1)
-#include "xe2/engine_xcpu.h"  // (one token's expert-cache misses computed by the CPU, ARC_XCPU=1)
+#include "xe2/engine_xcpu.h"  // (one token's expert-cache misses computed by the CPU, ARC_XCPU)
 #include "xe2/engine_xw.h"  // (the H8R GEMM on XMX with wider tiles, QUEUE 33.4: by default with h8_auto_ / the 140T preset; ARC_GEMM_XW)
 
 #include "npu/engine_npu.h"  // (the NPU experiment: a share of the Qwen FFN's gate / up on the NPU, ARC_NPU=1)
@@ -1693,12 +1829,15 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
 
   // Final norm of rows [r0, r0 + n) of x_ (per-32 layout, as the GEMVs expect; the f32 rows are also written to
   // `hout` when given), then the lm_head: logits_ row i belongs to x_ row r0 + i.
-  void head_rows(int r0, int n, cl_mem normw, cl_mem hout) {
+  // (hw: another head than lm_head_, the drafts' reduced one (ARC_MTP_VOCAB, engine_drafters.h); its N logits a row)
+  void head_rows(int r0, int n, cl_mem normw, cl_mem hout, const GpuWeight* hw = nullptr) {
+    const GpuWeight& H = hw ? *hw : lm_head_;
+    const int nl = hw ? hw->N : n_logits();
     const int saved = cur_T_;
     cur_T_ = n;
     if (hp.ds41) {  // DeepSeek-V4.1: the streams collapsed with the last FFN site's pre, then the output norm
       ds_collapse(ds_mixF_, 0, normw, r0, n, 16);
-      matmul("lm_head", lm_head_, 16, logits_, n_logits(), 0, 0, true);
+      matmul(hw ? "lm_head_draft" : "lm_head", H, 16, logits_, nl, 0, 0, true);
       cur_T_ = saved;
       return;
     }
@@ -1709,7 +1848,7 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
         CL_CHECK(clEnqueueCopyBuffer(cl_.queue, x_, hout, (size_t)r0 * W4, 0, (size_t)n * W4, 0, nullptr, nullptr));
       }
       hc_mix(out_hc_norm_, out_hc_down_, out_hc_up_, n, 16, 1, r0);
-      matmul("lm_head", lm_head_, 16, logits_, n_logits(), 0, 0, true);
+      matmul(hw ? "lm_head_draft" : "lm_head", H, 16, logits_, nl, 0, 0, true);
       cur_T_ = saved;
       return;
     }
@@ -1718,7 +1857,7 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
     set_args(k_rmsnorm_, 0, x_, r0, normw, E, M, nn, eps, aq_, asc_, absum_, hout ? hout : big_, wh, a32);
     size_t gws[2] = {256, (size_t)n}, lws[2] = {256, 1};
     run("rmsnorm_quant", k_rmsnorm_, 2, gws, lws);
-    matmul("lm_head", lm_head_, 16, logits_, n_logits(), 0, 0, true);
+    matmul(hw ? "lm_head_draft" : "lm_head", H, 16, logits_, nl, 0, 0, true);
     cur_T_ = saved;
   }
   void head(int T) { head_rows(T - 1, 1, out_norm_, has_mtp ? hlast_ : nullptr); }
@@ -1729,3 +1868,4 @@ __kernel void rd_strip(__global const uint* p, __global uint* out, int per_item)
 };
 
 #include "mgpu/engine_tp.h"  // (multi-GPU: TpEngine)
+#include "mgpu/engine_pp.h"  // (multi-GPU by layers: PpEngine, --split layer)

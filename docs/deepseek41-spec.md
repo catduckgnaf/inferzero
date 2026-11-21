@@ -8,7 +8,7 @@ Engram 110.6 GB): it can only be run on a tester's machine.
 
 Implemented (`zero/engine_ds41.h`, `zero/kernels/ops_ds41.cl`, the MoE path of `zero/engine_moe.h` with `moe.cl
 -DROUTE_DS` and `-DSWI_CLAMP`), and checked against the f32 reference `tools/ref_forward` (`deepseek41_layers`,
-written from section 3) on synthetic models from `tools/make_tiny_deepseek41.py`. The accuracy check of the real model
+written from section 3) on synthetic models from `tools/make_tiny_deepseek41.cpp` (a C++ port of the former .py since 2026-11-21). The accuracy check of the real model
 is against llama.cpp on the same prompts (the user's decision, 2026-11-11).
 
 **First run of the real model (issue #4, 2026-11-12, package fffaf1a):** `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS`
@@ -47,7 +47,7 @@ norms / mixes / biases F32, the Engram table `per_layer_token_embd` MXFP8 (202.8
 llama.cpp fork (one E8M0 scale and 32 E4M3 codes, 33 bytes; upstream ggml's 43 is plain F8_E4M3), "gather-only"
 there as here (the engine reads Engram rows on the CPU). The file has `exp_probs_b_vl.bias` too (not read: the
 vision path) and DSpark keys. Since 2026-11-14 the engine decodes both formats; checked on the tiny model with these
-types (`tools/make_tiny_deepseek41.py --unsloth`: 16 of 16 experts KL 0.0052 / 0.0052 against tools/ref_forward).
+types (`make_tiny_deepseek41 --unsloth`: 16 of 16 experts KL 0.0052 / 0.0052 against tools/ref_forward).
 
 What the server does with it: prompts and generation, the prompt-cache snapshots and saved conversations (format 3;
 `runz --snap-test` bit-identical). Not yet: slots, drafters (the DSpark MTP GGUF, section 3.9), images. Multi-GPU (`--gpus N`) since 2026-11-14: the

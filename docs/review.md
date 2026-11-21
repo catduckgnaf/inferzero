@@ -291,7 +291,7 @@ Gemma's Vulkan perplexity and a llama.cpp reference for the 35B (Unsloth's UD-IQ
 prompts on this iGPU would have taken hours more (the 27B's 34K prompt alone took 40 minutes on Vulkan). llama.cpp
 was not measured again after that day, while inferzero kept getting faster (the tables above).
 
-The tables are written by `bench/review_data.py` from `bench/results/results.jsonl`.
+The tables are written by `bench/review_data.ps1` from `bench/results/results.jsonl`.
 
 <!-- DATA-BEGIN -->
 Measured 2026-10-10 with the OpenCL engine; best of the repeated runs per engine. llama.cpp cannot load the GSQ 2-bit Qwen3.6 35B-A3B, so its row has inferzero only.
@@ -496,7 +496,7 @@ The ones that shaped the design:
   2-bit (ISTA-DASLab, converted) and Unsloth's UD-Q3_K_S / UD-Q3_K_M / MTP files; Qwen3.8 Flash Next GSQ-RCO IQ3_S;
   DFlash2 drafters from z-lab and incoai.
 - Comparison with llama.cpp: `bench/run_bench.ps1`, raw results in `bench/results/results.jsonl`, tables written by
-  `bench/review_data.py`. Each test preceded by 30 s of idle GPU; throughput the best of repeated runs.
+  `bench/review_data.ps1`. Each test preceded by 30 s of idle GPU; throughput the best of repeated runs.
 - Perplexity: 40 chunks of 512 tokens from 500 KB of llama.cpp documentation, second half of each chunk scored (the
   llama-perplexity method).
 - Level Zero numbers: `runz --bench-pp` (a prompt of N tokens, then 64 generated tokens) and server answers of

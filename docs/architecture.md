@@ -120,8 +120,8 @@ tools/      server.cpp (the HTTP API, built by zero/serverz.cpp) with server_cac
             (AutoRound INT4 experts), zero_recorder.cpp, tok_test.cpp, chat_render.cpp, gguf_dump.cpp, clinfo.cpp
 bench/      micro-benchmarks (gemv_bench, attn_dec_bench, attn_bench, bw_bench, gpu_bench, membw_probe, xw_peak, ...),
             run_bench.ps1 (comparison with llama.cpp), website_bench.ps1 / .sh (the website's numbers),
-            prompt_bench.py, review_data.py (review data); gemm_sweep.ps1 / decode_try.ps1 / .sh / xw_sweep.ps1 /
-            f33_sweep.ps1 / b60_sweep.ps1 / .sh / gemv_probe.ps1 / replay_probe.cpp (settings and launch costs to
+            prompt_bench.ps1, review_data.ps1 (review data); gpu_sweep.ps1 / .sh (every setting, tile and drafting mode on any GPU) /
+            f33_sweep.ps1 / gemv_probe.ps1 / replay_probe.cpp (settings and launch costs to
             measure on a discrete card)
 scripts/    zero-server.ps1 (server in the background), zero-launcher.ps1 (launcher window, zero-launcher.cmd) with
             launcher-*.ps1, get-models.ps1 + model-catalog.ps1 + hf-get.ps1 (downloads), autoround.ps1 /

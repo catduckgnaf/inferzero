@@ -160,6 +160,76 @@ static std::string peak_note(Engine& eng, double gbs) {
   return s;
 }
 
+// --gpus N --split layer: the model's layers over N GPUs (zero/mgpu/engine_pp.h): the prompt (or --bench-pp N), then
+// greedy generation, as run_tp; --tensor-split a,b,...: each GPU's share of the layers
+static int run_pp(const std::string& model, const EngineOptions& eo, int gpus, const std::vector<double>& shares,
+                  const std::vector<int>& toks, int n_gen, int bench_pp, const std::string& dump_logits, bool show) {
+  PpEngine pp(model, eo, gpus, shares);
+  Engine& el = pp.last();
+  Vocab vocab(el.gguf());
+  printf("loaded: %d GPUs by layers, %d layers, n_embd %d, vocab %d | GPU buffers", gpus, el.hp.n_layer, el.hp.n_embd,
+         el.hp.n_vocab);
+  for (int r = 0; r < gpus; ++r) printf(" %.2f", pp.gpu_bytes(r) / 1073741824.0);
+  printf(" GiB | chunk %d | ctx %d\n", el.max_chunk, el.ctx);
+  auto ms_since = [](std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+  };
+  std::vector<int> prompt = toks;
+  if (bench_pp > 0) {
+    prompt.resize(bench_pp);
+    for (int i = 0; i < bench_pp; ++i) prompt[i] = 1000 + (i * 7919) % 50000;
+  }
+  if (prompt.empty()) { zlog::eprintf("no tokens\n"); return 1; }
+  if (bench_pp > 0) pp.forward(prompt.data(), std::min((int)prompt.size(), 64));  // warm-up (kernels, page-in)
+  const int runs = bench_pp > 0 ? 3 : 1;
+  std::vector<float> lg;
+  for (int r = 0; r < runs; ++r) {
+    if (bench_pp > 0) pp.reset();
+    const auto t0 = std::chrono::steady_clock::now();
+    lg = pp.forward(prompt.data(), (int)prompt.size());
+    const double ms = ms_since(t0);
+    printf("pp%zu run %d: %.1f ms  ->  %.1f tokens/s\n", prompt.size(), r, ms, prompt.size() / ms * 1000.0);
+  }
+  if (bench_pp <= 0) {
+    std::vector<std::pair<int, float>> tk;
+    top_k(lg, 10, tk);
+    printf("top-10 next token:");
+    for (auto& [id, p] : tk) printf(" %d(%.4f)", id, p);
+    printf("\n");
+  }
+  FILE* dl = dump_logits.empty() ? nullptr : fopen(dump_logits.c_str(), "wb");
+  if (dl) fwrite(lg.data(), sizeof(float), lg.size(), dl);
+  int tok = (int)(std::max_element(lg.begin(), lg.end()) - lg.begin());
+  if (bench_pp > 0) tok = 1000;
+  std::vector<int> gen;
+  std::vector<double> step_ms;
+  const auto t1 = std::chrono::steady_clock::now();
+  for (int i = 0; i < n_gen; ++i) {
+    gen.push_back(tok);
+    if (bench_pp <= 0 && tok == vocab.eos) break;
+    const auto ts = std::chrono::steady_clock::now();
+    const auto& l2 = pp.forward(&tok, 1);
+    step_ms.push_back(ms_since(ts));
+    if (dl) fwrite(l2.data(), sizeof(float), l2.size(), dl);
+    tok = (int)(std::max_element(l2.begin(), l2.end()) - l2.begin());
+  }
+  if (dl) fclose(dl);
+  const double gms = ms_since(t1);
+  if (bench_pp <= 0) {
+    printf("greedy:");
+    for (int id : gen) printf(" %d", id);
+    printf("\n");
+  }
+  if (!step_ms.empty()) {
+    std::vector<double> st = step_ms;
+    std::sort(st.begin(), st.end());
+    printf("tg%zu: %.1f ms  ->  %.2f tokens/s | steps min %.1f, median %.1f ms\n", step_ms.size(), gms,
+           step_ms.size() / gms * 1000.0, st.front(), st[st.size() / 2]);
+  }
+  if (show) printf("----- text -----\n%s\n----------------\n", vocab.decode(gen).c_str());
+  return 0;
+}
+
 // --gpus N: the model split over N GPUs (zero/engine_tp.h): the prompt (or --bench-pp N), then greedy generation
 static int run_tp(const std::string& model, const EngineOptions& eo, int gpus, const std::vector<int>& toks, int n_gen,
                   int bench_pp, const std::string& dump_logits, bool show, const std::string& kl_ref, int bench_batch) {
@@ -389,11 +459,14 @@ static int run_main(int argc, char** argv) {
             "  --mtp-drafts N        drafts per step, 2..7 (default: 27B 7, on B-series cards 3; 35B-A3B 5; Qwen 4B and\n"
             "                        smaller, Flash Next 3; 9B 2; with --dflash 7); Gemma 4's drafter always drafts 3\n"
             "  --mtp-model F         the MTP head or drafter in a file of its own (Gemma 4 drafter; Qwen3.8 Flash Next's\n"
-            "                        mtp-*.gguf head); default: an mtp-*.gguf next to the model\n"
+            "                        mtp-*.gguf head; for a dense Qwen3.5 / 3.8 fine-tune without an MTP block, the\n"
+            "                        base model's .gguf, whose block must match it); default: an mtp-*.gguf next to the model\n"
             "  --dflash DIR          speculative decoding with a DFlash2 block drafter (Qwen3.8 27B, Qwen3.6 35B-A3B, Flash Next)\n"
             "  --draft auto|mtp|dflash  with --dflash: both drafters picked per step (auto), the MTP block only, or\n"
             "                        DFlash2 only (the MTP block is not loaded)\n"
             "  --mtp-min-p P         draft a second token only above this MTP probability (default 0.5)\n"
+            "  --copy-draft          with --mtp: where the last tokens appeared earlier in the context, draft what followed\n"
+            "                        them there (copy drafting; the same output, verified as any drafts)\n"
             "engine:\n"
             "  --ctx N               context (default: what the prompt needs)     --chunk N   prompt tokens per step\n"
             "  --feed-step N         feed the prompt in calls of N tokens (tests resuming mid-prompt)\n"
@@ -406,7 +479,11 @@ static int run_main(int argc, char** argv) {
             "  --gpus N              the model split over N GPUs (Qwen3.5 / 3.6 / 3.8, the 35B-A3B, Flash Next,\n"
             "                        DeepSeek-V4.1): the prompt or --bench-pp, then greedy generation (ARC_TP_SIM=1: N\n"
             "                        shards on GPU 0, to test the split)\n"
-            "  --attn-f32            f32 attention (f16 K/V)      --act256    one activation scale per 256 values (not 32)\n"
+            "  --split tensor|layer  with --gpus: tensor (the default) splits each layer's matrices over the GPUs, with\n"
+            "                        sums every layer; layer gives each GPU whole layers, one hand-off a token (Qwen's dense\n"
+            "                        models for now, no --mtp yet): no sums, so slow links cost little, but one request\n"
+            "                        runs at about one card's speed. --tensor-split a,b,...: each GPU's share of the layers\n"
+            "  --attn-f32           f32 attention (f16 K/V)      --act256    one activation scale per 256 values (not 32)\n"
             "  --npu on|off|force    the NPU computes part of each prompt chunk next to the GPU (27B, Gemma 12B; force: any\n"
             "                        Qwen3.5 / 3.6 / 3.8 or Gemma 4 model; default off, or ARC_NPU)\n"
             "profiling:\n"
@@ -444,7 +521,24 @@ static int run_main(int argc, char** argv) {
             "  the H8 GEMM's work-groups of 4 column sub-groups (2 / 8: that many), ARC_GEMM_XW_2D=0 its 2D block loads,\n"
             "  ARC_GEMV_DB=0 the GEMV's read-ahead (dense models), ARC_GEMV_WAVE=0 GEMV rows from the GPU's threads,\n"
             "  ARC_H8_GRF=256 / ARC_MOE_GRF=256 the H8 and MoE GEMM kernels' 256 registers (not 128), ARC_MOE_GEMM_PAD=0\n"
-            "  padded experts' gate / up per tile (Flash Next), ARC_140T=0 the Alchemist cards' Arc 140T preset\n");
+            "  padded experts' gate / up per tile (Flash Next), ARC_140T=0 the Alchemist cards' Arc 140T preset\n"
+            "  Opt-in on 8-lane XMX (A770, A750, Arc 140T): ARC_ATTN_X8=1 the prompt attention as flash attention on XMX\n"
+            "  (attn_x8; =2 its DPAS emulated on any GPU with 8-lane sub-groups, tests), ARC_ATTN_X8_WG=NT,NH\n"
+            "  ARC_GEMM_XW_GU=0 / 1: the FFN's gate and up GEMMs in one launch, the same results (on by default on discrete\n"
+            "  cards with 16-lane XMX, opt-in on the 140V / B390)\n"
+            "  8-lane XMX: ARC_GEMM_XW_SHAPE=0 one tile for every prompt GEMM (default on Alchemist, one GPU: a tile per shape;\n"
+            "  ARC_GEMM_XW_NC_E=2 turns it off),\n"
+            "  ARC_GEMM_XW_DB=0 / 1 the 32-token tiles' reads one step ahead (default on Alchemist), the same results;\n"
+            "                   =2 every tile, the next weights in place and the loop unrolled by 4 (opt-in)\n"
+            "  ARC_GEMM_XW_BIG=0 / 1 the 32 x 32 tile through local memory where it fits (default on Alchemist),\n"
+            "  ARC_GEMM_XW_EPI2=0 / 1 the epilogue a row at a time (default on Alchemist), ARC_GEMM_XW_SLM=1 / 2 / 8\n"
+            "  local memory with that many token sub-groups (=1: 4) on every tile it fits; all the same results\n"
+            "  MoE partly off the GPU: ARC_XCPU=0 / 1 the experts missing from the GPU cache computed by the CPU from the RAM\n"
+            "  tier (KL-checked; on by default on discrete 16-lane cards: the B-series, a Data Center Max; off on Alchemist and\n"
+            "  iGPUs; the same results run to run from the same cache state, its .lru file); in Flash Next's precise\n"
+            "  mode one int8 pass on the CPU by default (faster), ARC_XCPU_Q2=1 both passes as on the GPU (exact)\n"
+            "  ARC_XRAM_GB=N the RAM tier' size per GPU (0: none), ARC_XRAM_FILL=1 / 0 the expert cache's fill at start\n"
+            "  into the RAM tier too or not (default: not, where the tier and the cache cannot hold every expert)\n");
     return help ? 0 : 1;
   }
   std::string model = argv[1], tokens_arg, kl_ref, ppl_file, ppl_dump, text_prompt, dump_ids;
@@ -454,6 +548,8 @@ static int run_main(int argc, char** argv) {
   EngineOptions eo;
   bool prof = false, show = false, prof_gen = false, kl_decode = false, slots_check = false, must_fit = false;
   int bench_batch = 0;
+  std::string split_mode = "tensor";  // (--split tensor | layer: zero/mgpu/engine_tp.h or engine_pp.h)
+  std::vector<double> split_shares;   // (--tensor-split a,b,...: each GPU's share of the layers with --split layer)
   bool ring_snap_test = false;  // Gemma: a snapshot's ring copy restored after the rings moved on, logits bitwise
   bool snap_test = false;       // (--snap-test: a snapshot restored after other tokens, logits bitwise)
   std::string dump_logits;  // every generation step's logits (f32), to compare two builds / settings bitwise
@@ -506,6 +602,7 @@ static int run_main(int argc, char** argv) {
     else if (a == "--mtp-drafts") eo.mtp_drafts = atoi(next());
     else if (a == "--mtp-model") { eo.mtp_model = next(); eo.mtp = true; }  // (an MTP head / drafter file of its own)
     else if (a == "--mtp-min-p") eo.mtp_min_p = (float)atof(next());
+    else if (a == "--copy-draft") eo.copy_draft = true;  // (R1: drafts copied from the context where it repeats)
     else if (a == "--kl-ref") kl_ref = next();
     else if (a == "--slots-check") slots_check = true;
     else if (a == "--bench-batch") bench_batch = atoi(next());
@@ -522,6 +619,14 @@ static int run_main(int argc, char** argv) {
     else if (a == "--ppl-chunks") ppl_chunks = atoi(next());
     else if (a == "--budget") eo.w8_budget_gb = atof(next()), eo.w8_budget_set = true;
     else if (a == "--gpus") gpus = std::max(1, atoi(next()));
+    else if (a == "--split") {
+      split_mode = next();
+      if (split_mode != "tensor" && split_mode != "layer") { zlog::eprintf("--split: tensor or layer\n"); return 1; }
+    } else if (a == "--tensor-split") {
+      std::stringstream ss(next());
+      std::string t;
+      while (std::getline(ss, t, ',')) split_shares.push_back(atof(t.c_str()));
+    }
     else if (!a.empty() && a[0] != '-' && text_prompt.empty()) text_prompt = a;  // PROMPT (special tokens parsed)
     else { zlog::eprintf("unknown option %s (--help: the options)\n", a.c_str()); return 1; }
   }
@@ -588,6 +693,10 @@ static int run_main(int argc, char** argv) {
     return 0;
   }
   warn_gpu_neighbours();
+  if (gpus > 1 && split_mode == "layer") {
+    if (eo.mtp) { zlog::eprintf("--split layer: no --mtp yet (drafting over the stages: QUEUE)\n"); return 1; }
+    return run_pp(model, eo, gpus, split_shares, toks, n_gen, bench_pp, dump_logits, show);
+  }
   if (gpus > 1) {
     if (bench_batch > 1) eo.slots = std::min(bench_batch, Engine::kMaxSlots);  // (a split model's slots: made at load)
     return run_tp(model, eo, gpus, toks, n_gen, bench_pp, dump_logits, show, kl_ref, bench_batch);
@@ -608,12 +717,23 @@ static int run_main(int argc, char** argv) {
   {  // (more GPU memory than the share less the driver's part: Windows pages GPU memory and everything slows down many
      //  times over, Qwen3.8 27B with a 131K context on the laptop's 16.5 GiB share: 16.5 GiB used, prompt 8.6 instead of
      //  ~120 tok/s. The server's --ctx auto stays inside; runz takes the context it is given)
-    const double GiB = 1073741824.0, share = (double)eng.device_mem(), lim = share - Engine::driver_slack();
+    const double GiB = 1073741824.0, share = (double)eng.device_mem();
     fflush(stdout);
-    if ((double)eng.gpu_bytes > lim) {
-      zlog::eprintf("inferzero: does not fit: %.2f GiB of GPU memory for a context of %d, over the %.2f GiB share "
-                      "less %.1f for the driver; expect paging and far lower speeds (a smaller --ctx fits)\n",
-              eng.gpu_bytes / GiB, eng.ctx, share / GiB, Engine::driver_slack() / GiB);
+    if (getenv("ARC_FIT_PARTS")) {  // (diagnostics: the memory count the fit check reads, by part)
+      const auto m = eng.mem_parts(eng.ctx);
+      zlog::eprintf("inferzero: memory: GPU %.3f GiB = loaded %.3f (weights %.3f, MTP %.3f, buffers %.3f, context %.3f at %d) + "
+                    "after the load %.3f; ctx_bytes / %d tokens\n",
+                    eng.gpu_bytes / GiB, eng.loaded_bytes() / GiB, m.weights / GiB, m.mtp / GiB, m.buffers / GiB,
+                    m.context / GiB, eng.ctx, ((double)eng.gpu_bytes - (double)eng.loaded_bytes()) / GiB, eng.ctx);
+    }
+    if (!eng.fits_share()) {
+      const int fit = eng.max_fitting_ctx();
+      zlog::eprintf("inferzero: does not fit: %.2f GiB of GPU memory for a context of %d%s%s, over the %.2f GiB share "
+                      "less %.1f for the driver; expect paging and far lower speeds (%s)\n",
+              eng.gpu_bytes / GiB, eng.ctx, eo.mtp ? " with drafting" : "",
+              eng.host_weight_bytes() ? (", " + std::to_string((int)(eng.host_weight_bytes() / 1048576)) + " MiB of the weights in host memory too").c_str() : "",
+              share / GiB, Engine::driver_slack() / GiB,
+              fit > 0 ? ("--ctx " + std::to_string(fit) + " fits with every weight on the GPU").c_str() : "no context fits: a smaller model or fewer weights on the GPU");
       if (must_fit) return 3;  // (--must-fit: bench\website_bench.ps1 records the size as not fitting)
     }
   }
@@ -1420,7 +1540,7 @@ static int run_main(int argc, char** argv) {
     int tok = tk[0].first;
     const uint64_t rb0 = eng.rd_bytes;
     auto t1 = std::chrono::steady_clock::now();
-    int steps = 0, accepted = 0, drafted = 0;
+    int steps = 0, accepted = 0, drafted = 0, copy_steps = 0, copy_drafted = 0, copy_accepted = 0;
     double mtp_draft_ms = 0, mtp_verify_ms = 0, mtp_done_ms = 0;  // (where an MTP step's time goes, 2026-11-18)
     if (eng.has_mtp) {
       // speculative decoding with the MTP block: up to two drafts per step, verified by one main-model pass
@@ -1433,11 +1553,15 @@ static int run_main(int argc, char** argv) {
       FILE* dl = dump_logits.empty() ? nullptr : fopen(dump_logits.c_str(), "wb");
       struct Close { FILE*& f; ~Close() { if (f) fclose(f); } } close_dl{dl};
       if (dl) fwrite(lg.data(), sizeof(float), lg.size(), dl);
+      std::vector<int> hist(toks.begin(), toks.end());  // (the tokens before `tok`: copy drafting's context, R1)
       while ((int)gen.size() < n_gen) {
         gen.push_back(tok);
         if (tok == vocab.eos || (int)gen.size() >= n_gen) break;
         const auto c0 = std::chrono::steady_clock::now();
-        const std::vector<int> drafts = eng.mtp_draft(tok, eng.opt.mtp_drafts);
+        hist.resize(toks.size());
+        hist.insert(hist.end(), gen.begin(), gen.end() - 1);
+        const std::vector<int> drafts = eng.mtp_draft(tok, eng.opt.mtp_drafts, &hist);
+        const bool copied = eng.last_draft_copy();
         const auto c1 = std::chrono::steady_clock::now();
         const auto& lv = eng.verify(tok, drafts);
         const auto c2 = std::chrono::steady_clock::now();
@@ -1459,6 +1583,7 @@ static int run_main(int argc, char** argv) {
         ++steps;
         drafted += (int)drafts.size();
         accepted += acc;
+        if (copied) ++copy_steps, copy_drafted += (int)drafts.size(), copy_accepted += acc;
         if (stop) break;
         tok = next;
       }
@@ -1487,6 +1612,9 @@ static int run_main(int argc, char** argv) {
     }
     if (steps) printf("MTP: %d drafts, %d accepted (%.1f %%), %.2f tokens per main-model pass (%d passes)\n", drafted,
                       accepted, 100.0 * accepted / std::max(drafted, 1), (double)gen.size() / steps, steps);
+    if (copy_steps)
+      printf("copy drafting: %d of %d steps, %d drafts, %d accepted (%.1f %%)\n", copy_steps, steps, copy_drafted,
+             copy_accepted, 100.0 * copy_accepted / std::max(copy_drafted, 1));
     if (steps)
       printf("MTP time: drafting %.1f ms, verification %.1f ms (%.1f ms a pass), verify_done %.1f ms\n", mtp_draft_ms,
              mtp_verify_ms, mtp_verify_ms / steps, mtp_done_ms);

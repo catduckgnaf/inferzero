@@ -139,7 +139,8 @@
       size_t g1 = D, l1 = D;
       run("qsa", k, 1, &g1, &l1);
     }
-    if (b1 <= ntop && !getenv("ARC_QSA_ALWAYS")) return false;  // every row sees at most ntop blocks: dense
+    static const bool qsa_always = getenv("ARC_QSA_ALWAYS") != nullptr;  // (read once: every QSA layer)
+    if (b1 <= ntop && !qsa_always) return false;  // every row sees at most ntop blocks: dense
     {
       cl_kernel k = kernel("ops", defs, "qsa_q");
       set_args(k, 0, ixo, ld, p0, L.ix_qn, eps, ts, nr, qsa_qx_);
@@ -429,15 +430,18 @@
     const int E = hp.n_embd, F = hp.n_ff;
     const int a_in = act32_for(false);
     // prompt chunks: the up GEMM applies silu(gate) * up in its epilogue (no split-K for K = n_embd <= 8192)
-    const int fused = cur_T_ > 8 && E <= 8192 && !q2mm_ && L.up.N ? 1 : 0;  // (two passes: no fused epilogue)
+    const int fused = cur_T_ > 8 && E <= 8192 && !q2mm_ && !h8_q2() && L.up.N ? 1 : 0;  // (two passes: no fused epilogue)
     if (!fused) rmsnorm_quant(x_, 0, L.post_norm, E, Mp, T, a_in);
     if (!L.up.N) {  // (gate and up stacked, rows [gate | up] as below: one matmul; Qwen3 dense, see load_weights)
       matmul("gemm_gateup", L.gate, Mp, big_, 2 * F, 0, 0, a_in);
     } else if (fused) {
       H8Share sh(this);  // (one rotation of the input for both, engine_h8.h; with ARC_H8_NORM made by the norm)
       rmsnorm_h8(x_, 0, L.post_norm, E, Mp, T, a_in, L.gate);
-      matmul("gemm_gate", L.gate, Mp, big_, F, 0, 0, a_in);
-      matmul("gemm_up", L.up, Mp, big_, F, 0, 2, a_in);
+      // (ARC_GEMM_XW_GU=1: both in one gemm_xw launch, the same values; zero/xe2/engine_xw.h)
+      if (!xw_gu_matmul(L.gate, L.up, Mp, big_, F, a_in)) {
+        matmul("gemm_gate", L.gate, Mp, big_, F, 0, 0, a_in);
+        matmul("gemm_up", L.up, Mp, big_, F, 0, 2, a_in);
+      }
     } else if (gemv_gu(L.gate, L.up, Mp, big_)) {  // (one token, ARC_GEMV_GU=1: both in one launch, the same rows)
     } else {
       H8Share sh(this);

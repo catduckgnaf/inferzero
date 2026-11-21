@@ -434,6 +434,65 @@ $opt.Controls.Add($speechHead); $opt.SetColumnSpan($speechHead, 2)
 [void](Add-Opt "Qwen3-ASR" $asrBox "auto | off (Whisper alone) | a .gguf file")
 [void](Add-Opt "Whisper encoder on" $whDevBox -Advanced)
 [void](Add-Opt "Longest clip (minutes)" $whMaxBox "uploads and chat clips; the library takes up to 6 h" -Advanced)
+# ---- speed and accuracy options (QUEUE O1, 2026-11-21): one row a catalog entry of scripts\options.tsv (zero-server
+# start -Opt / -NoOpt / -DefaultOpt, kept in %USERPROFILE%\.inferzero\options.json), each with what it does and its
+# badges; one not for this PC greyed with the reason, not hidden. Precise mode and the decoded weights have fields of
+# their own above
+$optHead = New-Label "Speed and accuracy options" $true
+$optHead.Margin = New-Object System.Windows.Forms.Padding((S 3), (S 12), (S 3), (S 2))
+$opt.Controls.Add($optHead); $opt.SetColumnSpan($optHead, 2)
+$script:catalog = @()
+$catTsv = Join-Path $PSScriptRoot "options.tsv"
+if (Test-Path -LiteralPath $catTsv) {
+  $cl = [IO.File]::ReadAllText($catTsv, (New-Object Text.UTF8Encoding $false)) -split "\r?\n" | Where-Object { $_ -ne "" }
+  $cc = $cl[0] -split "`t"
+  $script:catalog = @(foreach ($l in $cl[1..($cl.Count - 1)]) {
+    $v = $l -split "`t"; $d = [ordered]@{}
+    for ($i = 0; $i -lt $cc.Count; $i++) { $d[$cc[$i]] = $(if ($i -lt $v.Count) { $v[$i] } else { "" }) }
+    [pscustomobject]$d
+  })
+}
+$optJson = Join-Path $env:USERPROFILE ".inferzero\options.json"
+function Read-OptChoice {
+  $c = @{}
+  if (Test-Path -LiteralPath $optJson) { try { (Get-Content -Encoding UTF8 -LiteralPath $optJson -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $c[$_.Name] = "$($_.Value)" } } catch {} }
+  return $c
+}
+# (which kinds of PC this is: scripts\pc-kinds.ps1, shared with zero-server options)
+. (Join-Path $PSScriptRoot "pc-kinds.ps1")
+$script:pcKinds = @(); try { $script:pcKinds = @(Get-PcKinds) } catch {}
+$script:optBoxes = [ordered]@{}
+$kindWords = @{ "alchemist" = "Arc A-series cards"; "b-series" = "Arc B-series cards"; "igpu-xe2" = "Lunar Lake / Panther Lake";
+  "igpu-140t" = "the Arc 140T"; "igpu-xe-lpg" = "Core Ultra (Meteor Lake)"; "multi-gpu" = "several GPUs" }
+foreach ($o in $script:catalog) {
+  if ($o.id -in "fn_precise", "budget") { continue }  # (their own fields above)
+  $box = New-Combo @("default", "on", "off") 80
+  $fit = @($o.best_for -split ';' | Where-Object { $kindWords.ContainsKey($_) })
+  $forHere = -not $fit.Count -or @($fit | Where-Object { $_ -in $script:pcKinds }).Count -gt 0
+  $badges = @()
+  if ($forHere -and $fit.Count) { $badges += "recommended for this PC" }
+  if (-not $forHere) { $badges += "not for this PC (for " + (($fit | ForEach-Object { $kindWords[$_] }) -join ", ") + ")" }
+  $badges += $(if ($o.output -eq "same") { "same output" } else { "slightly different output (checked)" })
+  if ($o.cost -match 'VRAM') { $badges += "uses VRAM: $($o.cost)" }
+  if ($o.status -eq "experimental") { $badges += "experimental" }
+  if ($o.conflicts) { $badges += $o.conflicts }
+  $row = Add-Opt $o.title $box ("default: " + $o.default)
+  $bt = $badges -join (" " + [char]0xB7 + " ")  # (a middle dot; written as a code: Windows PowerShell reads this file as ANSI)
+  $what = New-Label ($o.what + ". " + $bt.Substring(0, 1).ToUpper() + $bt.Substring(1) + "."); $what.ForeColor = $Pal.sub
+  $what.MaximumSize = New-Object System.Drawing.Size((S 560), 0)
+  [void]$row.Controls.Add($what); $row.WrapContents = $true; $row.MaximumSize = New-Object System.Drawing.Size((S 760), 0)
+  if (-not $forHere) { $box.ForeColor = $Pal.sub }
+  $tips.SetToolTip($box, "zero-server -Opt $($o.id) / -NoOpt $($o.id) ($($o.kind) $($o.name)); measured: $($o.measured); docs\options.md")
+  $script:optBoxes[$o.id] = $box
+}
+function Fill-OptBoxes {
+  $c = Read-OptChoice
+  foreach ($id in $script:optBoxes.Keys) {
+    $v = if ($c.ContainsKey($id)) { $c[$id] } else { "default" }
+    $script:optBoxes[$id].SelectedIndex = [math]::Max(0, $script:optBoxes[$id].Items.IndexOf($(if ($v -in "on", "off") { $v } elseif ($v -eq "default") { "default" } else { "on" })))
+  }
+}
+Fill-OptBoxes
 $advChk = New-Check "Show advanced options"
 $advChk.Margin = New-Object System.Windows.Forms.Padding((S 3), (S 12), (S 3), (S 4))
 $opt.Controls.Add($advChk); $opt.SetColumnSpan($advChk, 2)
@@ -749,13 +808,23 @@ function Update-Status {
   $id = $script:sync.id; $p = $script:sync.props; $busyAct = $script:actProc -and -not $script:actProc.HasExited
   $script:running = $id; $script:props = $p
   $st = $null
-  if (Test-Path $stateFile) { try { $st = Get-Content $stateFile -Raw | ConvertFrom-Json } catch {} }
+  if (Test-Path $stateFile) { try { $st = Get-Content -Encoding UTF8 $stateFile -Raw | ConvertFrom-Json } catch {} }
   if ($id) {
     $up = ""
     if ($st -and $st.started) { try { $up = "  |  up {0:hh\:mm\:ss}" -f ((Get-Date) - [datetime]$st.started) } catch {} }
     $busy = if ($p -and $p.stats.busy) { "  |  answering" } else { "" }
     $status.Text = ("On  -  {0}  |  context {1:N0}  |  {2}{3}{4}" -f $id, $(if ($p) { $p.n_ctx } else { 0 }), (Base), $up, $busy)
     $status.ForeColor = $Pal.ok
+    # (an Intel graphics driver older than the oldest measured right: serverz's /props driver_warning, 2026-11-20)
+    if ($p -and $p.driver_warning) {
+      $status.Text += "  |  OLD GRAPHICS DRIVER: answers may be wrong (details below)"
+      $status.ForeColor = $Pal.warn
+      # (once per server start: a bar with a button to Intel's driver page, W2's last part, 2026-11-21)
+      if ($script:drvBarFor -ne $id) {
+        $script:drvBarFor = $id
+        Show-Bar "Windows Update may have installed an old Intel graphics driver: answers may be wrong. Install Intel's current driver, then restart." "warn" -Details $p.driver_warning -ActionText "Intel's driver page" -Action { Start-Process "https://www.intel.com/content/www/us/en/download/785597/intel-arc-iris-xe-graphics-windows.html" }
+      }
+    }
   } elseif ($busyAct) {
     $status.Text = "Loading / stopping..."
     $status.ForeColor = $Pal.warn
@@ -774,6 +843,10 @@ function Update-Status {
   if ($id -and $p) {
     $L = New-Object System.Collections.Generic.List[string]
     $mem = $p.memory
+    if ($p.driver_warning) {
+      $L.Add("WARNING  $($p.driver_warning)")
+      $L.Add("")
+    }
     $L.Add("model    $id")
     $L.Add(("context  {0:N0} tokens, {1:N0} filled   chunk {2}" -f $p.n_ctx, $p.stats.position, $p.chunk))
     $L.Add(("MTP      {0}   images {1}   audio {2}" -f $(if ($p.mtp) { "yes ($($p.mtp_drafts) drafts)" } else { "no" }), $(if ($p.vision) { "yes" } else { "no" }), $(if ($p.audio) { "yes" } else { "no" })))
@@ -820,7 +893,7 @@ function Update-Log([switch]$Force) {
   $stamp = "$($fi.Length)|$($fi.LastWriteTimeUtc.Ticks)"
   if (-not $Force -and $stamp -eq $script:logStamp) { return }
   $script:logStamp = $stamp
-  $lines = @(Get-Content -LiteralPath $serverLog -Tail 500 -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch '^progress: ' })
+  $lines = @(Get-Content -Encoding UTF8 -LiteralPath $serverLog -Tail 500 -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch '^progress: ' })
   $logBox.Text = $lines -join "`r`n"
   if ($logFollow.Checked) { $logBox.SelectionStart = $logBox.TextLength; $logBox.ScrollToCaret() }
 }
@@ -891,7 +964,7 @@ function Start-List {
 }
 function Show-List {
   $sel = if ($grid.SelectedRows.Count) { $grid.SelectedRows[0].Tag.alias } else { $script:running }
-  $selPath = if (-not $sel -and (Test-Path $lastFile)) { (Get-Content $lastFile -Raw).Trim() } else { $null }
+  $selPath = if (-not $sel -and (Test-Path $lastFile)) { (Get-Content -Encoding UTF8 $lastFile -Raw).Trim() } else { $null }
   $grid.Rows.Clear()
   foreach ($m in $script:models) {
     $mm = $m.memory
@@ -941,7 +1014,7 @@ function Check-Jobs {
   foreach ($j in @($script:jobs)) {
     if (-not $j.proc.HasExited) { continue }
     $script:jobs.Remove($j)
-    $text = (Get-Content $j.out -Raw -ErrorAction SilentlyContinue) + (Get-Content $j.err -Raw -ErrorAction SilentlyContinue)
+    $text = (Get-Content -Encoding UTF8 $j.out -Raw -ErrorAction SilentlyContinue) + (Get-Content -Encoding UTF8 $j.err -Raw -ErrorAction SilentlyContinue)
     Remove-Item $j.out, $j.err -ErrorAction SilentlyContinue
     try { & $j.done $j.proc.ExitCode "$text" } catch { Show-Bar "Launcher error: $($_.Exception.Message)" "error" -Details "$($_.ScriptStackTrace)" }
   }
@@ -1084,6 +1157,18 @@ function Get-StartArgs([switch]$Speech) {
     $v = $script:extraArgs[$k]
     if ($v -is [bool]) { if ($v) { $a += "-$k" } } else { $a += @("-$k", $(if ("$v" -match '[\s\\/]') { "`"$v`"" } else { "$v" })) }
   }
+  # (the speed and accuracy options whose box differs from the choice zero-server keeps: on / off / back to default)
+  $saved = Read-OptChoice
+  $on = @(); $off = @(); $def = @()
+  foreach ($id in $script:optBoxes.Keys) {
+    $want = [string]$script:optBoxes[$id].SelectedItem
+    $have = if ($saved.ContainsKey($id)) { $(if ($saved[$id] -eq "off") { "off" } else { "on" }) } else { "default" }
+    if ($want -eq $have) { continue }
+    switch ($want) { "on" { $on += $id } "off" { $off += $id } default { $def += $id } }
+  }
+  if ($on.Count) { $a += @("-Opt", ($on -join ",")) }
+  if ($off.Count) { $a += @("-NoOpt", ($off -join ",")) }
+  if ($def.Count) { $a += @("-DefaultOpt", ($def -join ",")) }
   , $a
 }
 function Start-Selected([switch]$Speech) {
@@ -1135,7 +1220,7 @@ function Load-PresetList([string]$select = "") {
 }
 function Apply-Preset([string]$name) {
   $pp = Join-Path $presetDir "$name.json"
-  try { $o = Get-Content -LiteralPath $pp -Raw | ConvertFrom-Json } catch { Show-Bar "Preset '$name' could not be read: $($_.Exception.Message)" "error" -Details $pp; return }
+  try { $o = Get-Content -Encoding UTF8 -LiteralPath $pp -Raw | ConvertFrom-Json } catch { Show-Bar "Preset '$name' could not be read: $($_.Exception.Message)" "error" -Details $pp; return }
   $script:over = @{}; $script:extraArgs = [ordered]@{}
   $model = $null; $unknown = @()
   foreach ($p in $o.PSObject.Properties) {
@@ -1221,7 +1306,7 @@ $settingsFile = Join-Path $stateDir "launcher.json"
 $lastFile = Join-Path $stateDir "last-model.txt"
 if (Test-Path $settingsFile) {
   try {
-    $o = Get-Content $settingsFile -Raw | ConvertFrom-Json
+    $o = Get-Content -Encoding UTF8 $settingsFile -Raw | ConvertFrom-Json
     foreach ($p in $o.PSObject.Properties) { if ($fields.Contains($p.Name)) { $script:over[$p.Name] = $p.Value } }
   } catch {}
 }
@@ -1251,7 +1336,7 @@ $script:upd = @{ enabled = $true; last = ""; latest = ""; url = ""; newer = $fal
 # (the package a check was made for: the data folder is shared by every unpacked package, so a check made by an
 #  older one said "newer" in the new one too for 20 hours: issue #8. Its folder and serverz.exe's time)
 $pkgKey = "$root|" + $(try { (Get-Item -LiteralPath (Join-Path $root "bin\serverz.exe") -ErrorAction Stop).LastWriteTimeUtc.Ticks } catch { "" })
-if (Test-Path $updateFile) { try { $u = Get-Content $updateFile -Raw | ConvertFrom-Json; foreach ($p in $u.PSObject.Properties) { $script:upd[$p.Name] = $p.Value } } catch {} }
+if (Test-Path $updateFile) { try { $u = Get-Content -Encoding UTF8 $updateFile -Raw | ConvertFrom-Json; foreach ($p in $u.PSObject.Properties) { $script:upd[$p.Name] = $p.Value } } catch {} }
 function Save-Upd { try { ConvertTo-Json -InputObject $script:upd | Set-Content $updateFile -Encoding utf8 } catch {} }
 function Check-Update([switch]$Manual) {
   if (-not $Manual) {
@@ -1347,7 +1432,7 @@ $trayStop.Add_Click({ $msg.Text = "Stopping the server..."; Start-Action @("stop
 $trayQuit.Add_Click({ $form.Close() })
 $trayStart.Add_Click({
     $r = $null
-    if (Test-Path $lastFile) { $r = Find-Row ((Get-Content $lastFile -Raw).Trim()) }
+    if (Test-Path $lastFile) { $r = Find-Row ((Get-Content -Encoding UTF8 $lastFile -Raw).Trim()) }
     if (-not $r) { Show-Window; $msg.Text = "No default model yet: select one and press Start."; return }
     $grid.ClearSelection(); $r.Selected = $true
     Start-Selected
@@ -1367,7 +1452,7 @@ function Update-Tray($id, $busy) {
 }
 function Update-TrayMenu {
   $r = $null
-  if (Test-Path $lastFile) { try { $r = Find-Row ((Get-Content $lastFile -Raw).Trim()) } catch {} }
+  if (Test-Path $lastFile) { try { $r = Find-Row ((Get-Content -Encoding UTF8 $lastFile -Raw).Trim()) } catch {} }
   $trayStart.Text = if ($r) { "Start $($r.Tag.alias)" } else { "Start the default model" }
 }
 $script:trayHint = $false
@@ -1455,7 +1540,7 @@ function Show-LoadBar {
   try {
     $sf = Get-Item $stateFile -ErrorAction Stop
     if ($sf.LastWriteTime -ge $script:actStart) {
-      $line = Get-Content $serverLog -Tail 40 -ErrorAction SilentlyContinue | Where-Object { $_ -match '^progress: ' } | Select-Object -Last 1
+      $line = Get-Content -Encoding UTF8 $serverLog -Tail 40 -ErrorAction SilentlyContinue | Where-Object { $_ -match '^progress: ' } | Select-Object -Last 1
     }
   } catch {}
   $loadBar.Visible = $true
@@ -1476,8 +1561,8 @@ function Show-LoadBar {
 # what zero-server's exit code means (scripts\zero-server.ps1: 1 wrong option, 2 stopped while loading, 3 timeout,
 # 4 port in use)
 function Show-ActionFailed([int]$code) {
-  $err = Get-Content $script:actErr -Raw -ErrorAction SilentlyContinue
-  $out = @(Get-Content $script:actOut -ErrorAction SilentlyContinue | Where-Object { $_ })
+  $err = Get-Content -Encoding UTF8 $script:actErr -Raw -ErrorAction SilentlyContinue
+  $out = @(Get-Content -Encoding UTF8 $script:actOut -ErrorAction SilentlyContinue | Where-Object { $_ })
   $details = (($out | Select-Object -Last 25) -join "`r`n") + $(if ($err) { "`r`n$err" } else { "" })
   $first = @("$err" -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '^\s*(At |\+|CategoryInfo|FullyQualifiedErrorId)' })[0]
   $what = switch ($code) {
@@ -1498,12 +1583,12 @@ $timer.Add_Tick({
       if ($script:listProc -and $script:listProc.HasExited) {
         $script:listProc = $null
         try {
-          $script:models = @(Get-Content $script:listOut -Raw | ConvertFrom-Json | ForEach-Object { $_ })
+          $script:models = @(Get-Content -Encoding UTF8 $script:listOut -Raw | ConvertFrom-Json | ForEach-Object { $_ })
           Show-List
-        } catch { Show-Bar "Could not read the model list: $($_.Exception.Message)" "error" -Details (Get-Content (Join-Path $env:TEMP "zero-launcher-models.err") -Raw -ErrorAction SilentlyContinue) }
+        } catch { Show-Bar "Could not read the model list: $($_.Exception.Message)" "error" -Details (Get-Content -Encoding UTF8 (Join-Path $env:TEMP "zero-launcher-models.err") -Raw -ErrorAction SilentlyContinue) }
       }
       if ($script:actProc) {
-        $last = if (Test-Path $script:actOut) { Get-Content $script:actOut -Tail 1 -ErrorAction SilentlyContinue } else { $null }
+        $last = if (Test-Path $script:actOut) { Get-Content -Encoding UTF8 $script:actOut -Tail 1 -ErrorAction SilentlyContinue } else { $null }
         if ($last) { $msg.Text = "$last" }
         if ($script:actWhat -eq "start" -and -not $script:actProc.HasExited) { Show-LoadBar }
         if ($script:actProc.HasExited) {
@@ -1545,6 +1630,7 @@ $form.Add_Shown({
     Start-List
     $timer.Start()
     if (-not $SelfTest) { Check-Update }
+    if (-not $SelfTest) { try { Test-OldInstall } catch {} }  # (after an update into a new folder: the shortcut / PATH)
   })
 # -SelfTest <png>: once the list is in (at most 3 minutes), a picture of the window, the errors seen, and close
 if ($SelfTest) {
@@ -1560,6 +1646,17 @@ if ($SelfTest) {
         $i = $presetBox.Items.IndexOf($env:ARC_SELFTEST_PRESET)
         if ($i -gt 0) { $presetBox.SelectedIndex = $i }
         [Console]::Out.WriteLine("selftest preset: " + ((Get-StartArgs) -join " ") + "  |  fit: " + $fitLbl.Text + "  |  " + $msg.Text)
+      }
+      # ($env:ARC_SELFTEST_OPTS = "copy_draft=on,xcpu=off": those boxes set, the options scrolled into view, and what Start
+      #  would pass printed)
+      if ($env:ARC_SELFTEST_OPTS) {
+        foreach ($kv in $env:ARC_SELFTEST_OPTS -split ',') {
+          $id, $v = $kv -split '=', 2
+          if ($script:optBoxes.Contains($id)) { $script:optBoxes[$id].SelectedIndex = $script:optBoxes[$id].Items.IndexOf($v) }
+        }
+        $last = @($script:optBoxes.Values)[-1]
+        if ($last) { $opt.ScrollControlIntoView($last) } else { $opt.ScrollControlIntoView($optHead) }
+        [Console]::Out.WriteLine("selftest options: pc " + ($script:pcKinds -join ",") + "; rows " + $script:optBoxes.Count + "; start: " + ((Get-StartArgs) -join " "))
       }
       $form.Refresh(); [System.Windows.Forms.Application]::DoEvents()
       $bmp = New-Object System.Drawing.Bitmap($form.Width, $form.Height)

@@ -59,7 +59,7 @@ the engine or the kernels.
 **Good places to start:**
 - the issues labelled [good first issue](https://github.com/rizagp/inferzero/labels/good%20first%20issue) and
   [help wanted](https://github.com/rizagp/inferzero/labels/help%20wanted);
-- a kernel on a card you own: `bench/` has micro-benchmarks for the GEMMs (`xw_peak`, `gemm_sweep.ps1`), the GEMVs
+- a kernel on a card you own: `bench/` has micro-benchmarks for the GEMMs (`xw_peak`; `gpu_sweep.ps1` / `.sh` sweeps every setting and tile with a model), the GEMVs
   (`gemv_bench`), attention (`attn_bench`) and memory (`bw_bench`);
 - Linux: the port works headless (`serverz`); packaging for more distributions, and the Docker / Kubernetes files in
   the repository, are untested by us;

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inferzero on several GPUs: when it helps, and direct copies on Linux (P2PDMA)</title>
+<meta name="description" content="How to split one model over several Intel Arc GPUs with inferzero, when it is faster, and how to turn on direct GPU-to-GPU copies (P2PDMA) on Linux for the best speed.">
+<meta name="color-scheme" content="light">
+<meta property="og:title" content="inferzero: free, open-source AI on your Intel PC">
+<meta property="og:description" content="Run Qwen, Gemma 4 and DeepSeek models on Intel Core Ultra graphics and Arc cards. Free, open source, no cloud.">
+<meta property="og:type" content="website">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to the content</a>
+
+<header>
+  <div class="wrap">
+    <a class="brand" href="index.html" aria-label="inferzero, home page"><svg class="mark" width="26" height="26" viewBox="0 0 64 64" aria-hidden="true"><rect class="l" x="1.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="49.5" y="1.5" width="13" height="13" rx="3"/><rect class="d" x="1.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="17.5" y="17.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="49.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="1.5" y="33.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="33.5" width="13" height="13" rx="3"/><rect class="d" x="33.5" y="33.5" width="13" height="13" rx="3"/><rect class="d" x="49.5" y="33.5" width="13" height="13" rx="3"/><rect class="l" x="1.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="49.5" y="49.5" width="13" height="13" rx="3"/></svg>inferzero</a>
+    <nav aria-label="Main">
+      <a href="index.html#start">Install</a>
+      <a href="results.html">Results</a>
+      <a href="multi-gpu.html" aria-current="page">Several GPUs</a>
+      <a href="index.html#open">Help out</a>
+    </nav>
+    <div class="hdr-right">
+      <a class="gh" href="https://github.com/rizagp/inferzero">GitHub</a>
+      <a class="btn p sm" href="https://github.com/rizagp/inferzero/releases/latest">Download</a>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="wrap hero small" id="top">
+  <h1>Several GPUs</h1>
+  <p class="lead">inferzero can split one model over 2 to 4 Intel GPUs. Each card holds part of every layer, and the cards add their results together after each layer. This page says when that is worth it, how to start it, and how to make the cards talk to each other directly on Linux, which is where most of the speed comes from.</p>
+  <nav class="jump" aria-label="On this page">
+    <a href="#when">When it helps</a><a href="#run">How to run it</a><a href="#check">Check your setup</a><a href="#p2pdma">Turn on P2PDMA</a><a href="#hardware">Slots and BIOS</a><a href="#verify">Confirm it works</a>
+  </nav>
+</div>
+
+<section id="when">
+  <div class="wrap">
+    <h2>When it helps</h2>
+    <p>Generation is limited by how fast weights are read from memory. Split over two cards, each reads half, so one conversation writes faster. The cost: after every layer the cards must add up their results, and how fast they can do that decides whether the split pays.</p>
+    <div class="tbl"><table>
+      <thead><tr><th>Setup</th><th class="n">1 card</th><th class="n">2 cards</th><th>What decides it</th></tr></thead>
+      <tbody>
+        <tr><td>2 × Arc Pro B60, Linux <small>Qwen3.8 27B, generation (tg)</small></td><td class="n">23.7</td><td class="n">37.5</td><td>Linux: the cards can copy to each other directly</td></tr>
+        <tr><td>2 × Arc A770, Windows <small>Qwen3.8 27B, tg</small></td><td class="n">21.2</td><td class="n">16.2</td><td>Windows: every sum goes through host memory</td></tr>
+        <tr><td>2 × Arc A770, Windows <small>Qwen3.6 35B-A3B, tg</small></td><td class="n">20.4</td><td class="n">28.3</td><td>the model does not fit one 16 GB card; on two, all of it does</td></tr>
+        <tr><td>2 × Arc Pro B50, Linux <small>Qwen3.6 35B-A3B, tg</small></td><td class="n">46.8</td><td class="n">63-67</td><td>the same: the model fits only when split</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note">Tokens per second. tg = generation, how fast the answer is written; pp = prompt processing, how fast the prompt is read. Every number, with its release and who measured it: <a href="results.html">results</a>.</p>
+    <div class="grid" style="margin-top:16px">
+      <div class="card"><h3>Worth splitting</h3><p>A model that does not fit on one card. And on Linux with direct copies (below), a model that does fit, for faster answers.</p></div>
+      <div class="card"><h3>Usually not</h3><p>On Windows, a model that fits one card: the drivers allow no direct copies between Arc cards, so the sums wait on host memory and two cards can be slower than one.</p></div>
+      <div class="card"><h3>A slow slot</h3><p>A card in a PCIe x4 slot (often a chipset slot) holds the pair back: one such setup read prompts at half of one card's speed. A split by layers, which needs far less traffic, is planned.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="run">
+  <div class="wrap">
+    <h2>How to run it</h2>
+    <ul>
+      <li><b>Windows launcher:</b> in the advanced options, set <b>GPUs (one model split)</b> to 2, 3 or 4 before starting the model.</li>
+      <li><b>Linux launcher:</b> <code>./zero-launcher.sh --gpus 2</code>.</li>
+      <li><b>Server or benchmark</b> (from the package folder; <code>bin\</code> on Windows): <code>./bin/serverz -m &lt;model.gguf&gt; --gpus 2</code>, or <code>./bin/runz &lt;model.gguf&gt; --gpus 2 --bench-pp 4096 --n 128</code>.</li>
+    </ul>
+    <p>Qwen models (dense, the 35B-A3B, Flash Next) and DeepSeek-V4.1 split; a model that cannot be split loads on one GPU. Gemma 4 is not split yet, and drafting (MTP) is off on a split model. Several conversations at once (<code>--slots</code>) work split too.</p>
+  </div>
+</section>
+
+<section id="check">
+  <div class="wrap">
+    <h2>Check your setup: do the cards copy directly?</h2>
+    <p>On Linux, Intel's <code>xe</code> driver lets one GPU read another's memory only when the kernel was built with <code>CONFIG_PCI_P2PDMA</code>. Without it, everything still works, but every sum takes the detour through host memory. Two quick checks:</p>
+<pre>grep P2PDMA /boot/config-$(uname -r)          # want: CONFIG_PCI_P2PDMA=y
+zcat /proc/config.gz | grep P2PDMA            # if the first file is missing</pre>
+    <p>Then, from the inferzero folder, <code>./bin/mgpu_probe</code> times every pair of GPUs. The <code>peer</code> column says whether the driver allows direct copies, and the rows compare direct copies with copies through host memory:</p>
+<pre>pair     peer   path                     20 KB (us)   40 MB (ms)       GB/s
+0 -> 1   yes    direct, copy engine            13.4         8.68        4.8
+0 -> 1   yes    via host, copy engine          18.4        14.46        2.9</pre>
+    <p class="note">Two Arc Pro B50s on PCIe 3.0 x8 (catduckgnaf, <a href="https://github.com/rizagp/inferzero/issues/59">#59</a>). With their distribution's stock kernel the direct rows failed and only the host path worked.</p>
+    <div class="tbl"><table>
+      <thead><tr><th>System</th><th>Direct copies</th><th>Seen on</th></tr></thead>
+      <tbody>
+        <tr><td>Ubuntu 26.04</td><td>yes</td><td>2 × Pro B60 (<a href="https://github.com/rizagp/inferzero/issues/17">#17</a>)</td></tr>
+        <tr><td>CachyOS</td><td>yes</td><td>2 × Pro B60 (<a href="https://github.com/rizagp/inferzero/issues/19">#19</a>)</td></tr>
+        <tr><td>Rocky Linux 9.7</td><td>yes</td><td>Data Center GPU Max 1550 (<a href="https://github.com/rizagp/inferzero/issues/48">#48</a>)</td></tr>
+        <tr><td>Unraid 7.4.0, stock kernel</td><td>no: built without P2PDMA</td><td>2 × Pro B50 (<a href="https://github.com/rizagp/inferzero/issues/59">#59</a>)</td></tr>
+        <tr><td>Unraid 7.4.0, kernel rebuilt with P2PDMA</td><td>yes</td><td>the same two B50s</td></tr>
+        <tr><td>Windows 11</td><td>no: the driver reports no peer access</td><td>4 × Pro B60, 2 × A770</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note">Other distributions have not been tested with two cards yet. The check above takes a second; please tell us what yours says.</p>
+  </div>
+</section>
+
+<section id="p2pdma">
+  <div class="wrap">
+    <h2>Turn on P2PDMA</h2>
+    <p>If <code>grep</code> printed <code>CONFIG_PCI_P2PDMA=y</code>, there is nothing to do. If it printed <code># CONFIG_PCI_P2PDMA is not set</code> or nothing:</p>
+    <ol class="go">
+      <li><b>Easiest: use a kernel that has it.</b> Your distribution's other kernels (a newer or "generic" one) may; the systems in the table above have it in their standard kernels.</li>
+      <li><b>Or rebuild your kernel with it.</b> In the kernel source, starting from your running kernel's configuration:
+<pre>cp /boot/config-$(uname -r) .config
+scripts/config --enable PCI_P2PDMA
+make olddefconfig
+grep P2PDMA .config        # must still say =y</pre>
+        If <code>olddefconfig</code> turned it off again, a setting it needs is off: P2PDMA needs <code>ZONE_DEVICE</code>, which needs memory hot-plug and hot-remove (<code>MEMORY_HOTPLUG</code>, <code>MEMORY_HOTREMOVE</code>). Enable those the same way, then build and install the kernel as your distribution documents, and reboot into it.</li>
+      <li><b>Unraid:</b> its stock kernel lacks it. catduckgnaf rebuilt the same kernel (6.18.60) with <code>CONFIG_PCI_P2PDMA=y</code>, and direct copies worked (<a href="https://github.com/rizagp/inferzero/issues/59">#59</a>).</li>
+    </ol>
+  </div>
+</section>
+
+<section id="hardware">
+  <div class="wrap">
+    <h2>Slots and BIOS</h2>
+    <dl class="need">
+      <dt>Slots</dt>
+      <dd>Put the cards in slots wired to the CPU (x8 or x16), not a chipset x4 slot. With one card in a chipset x4 slot (2.4 GB/s), that link sets the pace for both.</dd>
+      <dt>Two CPUs</dt>
+      <dd>On a two-socket board, put both cards under the same CPU. Moving one B50 to the same socket as the other took the split prompt from ~710 to ~975 tok/s.</dd>
+      <dt>BIOS</dt>
+      <dd>Turn on Above 4G Decoding and Resizable BAR, as Arc cards need anyway.</dd>
+      <dt>IOMMU</dt>
+      <dd>If the driver reports peer access but the copies fail, the engine falls back to host memory and says so in its log; an IOMMU is usually in the way then. The working B50 machine ran its IOMMU in passthrough mode (<code>iommu=pt</code> on the kernel command line).</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="verify">
+  <div class="wrap">
+    <h2>Confirm it works</h2>
+    <p>At load, inferzero times every link and picks the faster path for the sums. Its log says which:</p>
+<pre>inferzero: links: GPU 0 -> host 12.1 GB/s, host -> GPU 0 11.8 GB/s, -> GPU 1 13.0 GB/s
+inferzero: the GPUs' sums go straight from GPU to GPU (13.0 GB/s directly against 11.8 through host memory)</pre>
+    <p>To compare both paths yourself, run the same benchmark with each forced:</p>
+<pre>ARC_TP_P2P=1 ./bin/runz &lt;model.gguf&gt; --gpus 2 --bench-pp 4096 --n 128   # direct
+ARC_TP_P2P=0 ./bin/runz &lt;model.gguf&gt; --gpus 2 --bench-pp 4096 --n 128   # through host memory</pre>
+    <p>On two Pro B60s with equal link speeds, direct was 13-17 % faster for prompts (1,630 against 1,442 tok/s) and the answers were identical bit for bit. With direct copies available the engine may still pick host memory where that measures faster: on Data Center GPU Max stacks it does for generation.</p>
+    <p class="note">The design, every switch and its failsafes: <a href="https://github.com/rizagp/inferzero/blob/main/docs/multi-gpu.md">docs/multi-gpu.md</a>. Ran it on your machine? <a href="https://github.com/rizagp/inferzero/issues/new?template=hardware-results.yml">Post your results</a>; two-card setups on new systems are especially welcome.</p>
+  </div>
+</section>
+
+</main>
+
+
+
+<footer>
+  <div class="wrap">
+    <div>inferzero · Apache 2.0 · <span class="mono">release 2026.11.19.01</span><br>An independent project, not made or endorsed by Intel. Intel and Arc are trademarks of Intel Corporation or its subsidiaries.</div>
+    <div><a href="https://github.com/rizagp/inferzero">GitHub</a> · <a href="https://github.com/rizagp/inferzero/releases">Releases</a> · <a href="https://github.com/rizagp/inferzero/blob/main/USAGE.md">Usage guide</a> · <a href="https://github.com/rizagp/inferzero/blob/main/CHANGELOG.md">Changelog</a></div>
+  </div>
+</footer>
+</body>
+</html>

@@ -142,6 +142,77 @@ inline void print_gpu() {
     LOG_ERR("GPU: none found (Level Zero did not start: is the Intel graphics driver installed?)\n");
   }
 }
+// The speed and accuracy options (scripts/options.tsv, QUEUE O5, 2026-11-21) that are in effect, in words: an env
+// option whose variable is set, a flag option on the command line, however they got there (the launchers, zero-server
+// -Opt, Docker's OPTIONS, by hand). "options: CPU experts: off; Copy drafting; Resident weights (12)". The catalog is
+// found next to the package (bin/../scripts) or in the folder the server runs in; without it, no line
+inline std::string options_in_effect(const std::filesystem::path& exe_dir, const std::vector<std::string>& args) {
+  std::ifstream f;
+  for (const auto& p : {exe_dir.parent_path() / "scripts" / "options.tsv", exe_dir / "scripts" / "options.tsv",
+                        std::filesystem::current_path() / "scripts" / "options.tsv"}) {
+    f.open(p, std::ios::binary);
+    if (f) break;
+    f.clear();
+  }
+  if (!f) return "";
+  auto split = [](std::string l) {
+    if (!l.empty() && l.back() == '\r') l.pop_back();
+    std::vector<std::string> v;
+    for (size_t a = 0;;) {
+      const size_t b = l.find('\t', a);
+      v.push_back(l.substr(a, b == std::string::npos ? std::string::npos : b - a));
+      if (b == std::string::npos) break;
+      a = b + 1;
+    }
+    return v;
+  };
+  std::string line;
+  if (!std::getline(f, line)) return "";
+  const std::vector<std::string> head = split(line);
+  auto col = [&](const char* n) {
+    for (size_t i = 0; i < head.size(); ++i)
+      if (head[i] == n) return (int)i;
+    return -1;
+  };
+  const int ck = col("kind"), cn = col("name"), con = col("on"), coff = col("off"), ct = col("title");
+  if (ck < 0 || cn < 0 || con < 0 || coff < 0 || ct < 0) return "";
+  std::string out;
+  auto add = [&](const std::string& s) { out += (out.empty() ? "" : "; ") + s; };
+  while (std::getline(f, line)) {
+    const std::vector<std::string> v = split(line);
+    auto at = [&](int i) { return i < (int)v.size() ? v[i] : std::string(); };
+    const std::string kind = at(ck), name = at(cn), on = at(con), off = at(coff), title = at(ct);
+    if (name.empty() || title.empty()) continue;
+    if (kind == "env") {
+      const char* e = getenv(name.c_str());
+      if (!e) continue;
+      const std::string val = e;
+      if (val == on) add(title);
+      else if (!off.empty() && val == off) add(title + ": off");
+      else add(title + " (" + name + "=" + val + ")");
+    } else if (kind == "flag") {
+      for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] != name) continue;
+        // (on: empty, a switch; "<GiB>", a value the user gives, shown; a word, the value that turns it on: --split
+        //  layer is "Multi-GPU by layers", --split tensor is the default and not named)
+        const std::string val = i + 1 < args.size() ? args[i + 1] : std::string();
+        if (on.empty()) add(title);
+        else if (on[0] == '<') add(title + " (" + val + ")");
+        else if (val == on) add(title);
+        else continue;
+        break;
+      }
+    }
+  }
+  return out.empty() ? "none (the defaults)" : out;
+}
+inline void print_options(const std::filesystem::path& exe_dir, const std::vector<std::string>& args) noexcept {
+  try {
+    const std::string o = options_in_effect(exe_dir, args);
+    if (!o.empty()) LOG_INF("options: %s\n", o.c_str());
+  } catch (...) {
+  }
+}
 // (never stops the server: a part that fails says so and the start goes on)
 inline void print(const std::filesystem::path& exe_dir, bool gpu) noexcept {
   try {
